@@ -1,0 +1,977 @@
+// The terminal: what a program's output does to a screen.
+//
+// A program on a terminal writes text and escape sequences -- move the
+// cursor, colour what follows, clear a line, scroll a region, switch to the
+// alternate screen -- and this is the machine that obeys them: the screen as
+// a grid of cells, the cursor, the pen they are written with, and the modes
+// a program can set. It speaks the xterm dialect `TERM=xterm-256color`
+// promises, as far as the programs people run use it: 16, 256 and 24-bit
+// colour, scroll regions, insert and delete, the alternate screen (vim, less,
+// htop), DEC line drawing (tmux's borders), bracketed paste, application
+// cursor keys, the replies a program asks for (where is the cursor, what are
+// you), and the operating-system commands a shell sends -- the title, the
+// working directory (OSC 7), and the marks of shell integration (OSC 133),
+// which is what lets the window know where a command began and how it ended.
+//
+// **It is pure.** `feed term bytes` answers the next terminal; what the
+// program must be told back (`replies`) and what happened that the window
+// cares about (`events`) are fields of it, taken by whoever drives it. So the
+// whole of it is tested here by feeding it text, with no terminal in sight.
+//
+// **Lines are numbered from the start of the session**, not from the top of
+// the screen: line `n` stays line `n` as it scrolls up into the history, so
+// a scroll of the whole screen changes one line -- the new one at the bottom
+// -- and that is all a window drawing it has to be told. `dirty` is the set
+// of line numbers changed since `take_updates` last asked.
+//
+// **A row is two trunks**: its characters and their styles, changed by
+// slices -- a run of text replaces a run of cells with three of each -- and
+// in place as they are used linearly, so writing a line costs the line. A
+// style is one integer (`pen`): eight bits of flags, then the foreground and
+// background, each `0` for the terminal's own, `1 + n` for palette colour
+// `n`, or `2^24 + rgb`.
+//
+// **Input arrives in pieces** that may end in the middle of a sequence or of
+// a UTF-8 character. What cannot be finished is kept (`pending`) and read
+// again in front of the next piece, so the parser itself never has to be in
+// the middle of anything.
+import std.char;
+import std.list;
+import std.map;
+import std.num;
+import std.str;
+import std.trunk;
+import std.http.url;
+
+// --- styles ------------------------------------------------------------------------
+
+/// Bits of a style's flags, the same as `std.graphics.widgets`' spans.
+let bold : :integer;
+let bold = 1;
+let dim : :integer;
+let dim = 2;
+let italic : :integer;
+let italic = 4;
+let underline : :integer;
+let underline = 8;
+let inverse : :integer;
+let inverse = 16;
+let strike : :integer;
+let strike = 32;
+let blink : :integer;
+let blink = 64;
+let hidden : :integer;
+let hidden = 128;
+
+priv let fg_unit = 256;
+priv let bg_unit = 8589934592;
+priv let colour_span = 33554432;
+
+let flags_of : :integer -> :integer;
+let flags_of s = s % 256;
+let fg_of : :integer -> :integer;
+let fg_of s = (s / fg_unit) % colour_span;
+let bg_of : :integer -> :integer;
+let bg_of s = s / bg_unit;
+let pen : :integer -> :integer -> :integer -> :integer;
+let pen flags fg bg = flags + fg * fg_unit + bg * bg_unit;
+
+priv let with_flag on bit s = if on { if s % (bit * 2) >= bit { s } else { s + bit } }
+    else { if s % (bit * 2) >= bit { s - bit } else { s } };
+priv let with_fg c s = s - fg_of s * fg_unit + c * fg_unit;
+priv let with_bg c s = s - bg_of s * bg_unit + c * bg_unit;
+
+/// A colour as CSS: the 16 of the palette as the theme's variables, so a
+/// change of theme recolours them; the 6x6x6 cube and the grey ramp of the
+/// 256; and 24-bit colour as written. `""` is the terminal's own.
+let css_colour : :integer -> :string;
+let css_colour c = if c == 0 { "" } else if c <= 16 { "var(--dw-ansi-" + to_string (c - 1) + ")" }
+    else if c <= 256 {
+        let n = c - 1;
+        if n >= 232 { let g = 8 + 10 * (n - 232); rgb g g g } else {
+            let i = n - 16;
+            rgb (level (i / 36)) (level ((i / 6) % 6)) (level (i % 6))
+        }
+    } else { let v = c - 16777216; rgb (v / 65536) ((v / 256) % 256) (v % 256) };
+
+priv let level i = if i == 0 { 0 } else { 55 + 40 * i };
+priv let rgb r g b = "#" + num.hex 2 r + num.hex 2 g + num.hex 2 b;
+
+// --- rows ------------------------------------------------------------------------
+
+/// One line of cells: each a character, `' '` for one never written, and its
+/// style. `'\0'` is the second half of a wide character. `used` is how far
+/// along the line anything has been written: every cell past it is a blank
+/// in the default style, which is what lets a short line in a wide window
+/// cost its length, not the window's, when it is drawn. `wrapped` says the
+/// line went on to the next because it ran out of room, not because of a
+/// newline, which is what copying the text back out must know.
+struct Row {
+    cells : :trunk
+    styles : :trunk
+    used : :integer
+    wrapped : :bool
+}
+
+/// A row of `n` empty cells, in the background of `style`.
+let blank : :integer -> :integer -> Row;
+let blank n style = {
+    let bg = pen 0 0 (bg_of style);
+    Row.make (trunk.of (list.replicate n ' ')) (trunk.of (list.replicate n bg)) (if bg == 0 { 0 } else { n }) false
+};
+
+priv let row_fit n r = {
+    let have = trunk.length (Row.cells r);
+    if have == n { r } else if have > n {
+        Row.make (trunk.take n (Row.cells r)) (trunk.take n (Row.styles r)) (num.min n (Row.used r)) (Row.wrapped r)
+    } else {
+        Row.make (trunk.concat (Row.cells r) (trunk.of (list.replicate (n - have) ' ')))
+            (trunk.concat (Row.styles r) (trunk.of (list.replicate (n - have) 0))) (Row.used r) (Row.wrapped r)
+    }
+};
+
+/// A row's text, its trailing blanks dropped.
+let row_text : Row -> :string;
+let row_text r = str.trim_end (str.of_chars (list.filter (fn c -> c != '\0') (trunk.to_list (trunk.take (Row.used r) (Row.cells r)))));
+
+/// A row as the spans a window draws: `[text, fg, bg, flags]` for each run of
+/// cells in one style, its trailing blank cells left out.
+let spans : Row -> [[:any]];
+let spans r = {
+    let used = Row.used r;
+    let cells = trunk.to_list (trunk.take used (Row.cells r));
+    let styles = trunk.to_list (trunk.take used (Row.styles r));
+    let rec runs cs ss style acc out = match cs {
+        [] => list.reverse (if acc == [] { out } else { list.cons (span_of style acc) out }),
+        _ => {
+            let ch = list.head cs;
+            let st = list.head ss;
+            if ch == '\0' { runs (list.tail cs) (list.tail ss) style acc out }
+            else if st == style || acc == [] { runs (list.tail cs) (list.tail ss) st (list.cons ch acc) out }
+            else { runs (list.tail cs) (list.tail ss) st [ch] (list.cons (span_of style acc) out) }
+        },
+    };
+    let all = runs cells styles 0 [] [];
+    // Trailing spaces in the default style say nothing, and cost a node.
+    match list.reverse all {
+        [] => [],
+        [last, ..before] => {
+            let [text, fg, bg, flags] = last;
+            let trimmed = if fg == "" && bg == "" && flags % 32 < 16 { str.trim_end text } else { text };
+            list.reverse (if trimmed == "" { before } else { list.cons [trimmed, fg, bg, flags] before })
+        },
+    }
+};
+
+priv let span_of style chars = [str.of_chars (list.reverse chars), css_colour (fg_of style), css_colour (bg_of style), flags_of style];
+
+/// `n` copies of `x`, as a trunk.
+priv let run_of n x = trunk.of (list.replicate n x);
+
+/// Cells `[x, x + len cs)` of a row replaced by `cs`, in `style`.
+priv let write_run x cs style r = {
+    let n = len cs;
+    Row.make (trunk.concat (trunk.concat (trunk.take x (Row.cells r)) (trunk.of cs)) (trunk.drop (x + n) (Row.cells r)))
+        (trunk.concat (trunk.concat (trunk.take x (Row.styles r)) (run_of n style)) (trunk.drop (x + n) (Row.styles r)))
+        (num.max (Row.used r) (x + n)) (Row.wrapped r)
+};
+
+// --- the terminal ----------------------------------------------------------------
+
+/// Where the cursor was saved, and how it was writing (DECSC).
+struct Saved {
+    x : :integer
+    y : :integer
+    pen : :integer
+    dec : :bool
+}
+
+mapping Term {
+    cols : :integer = 80
+    rows : :integer = 24
+    grid : :trunk = trunk.empty
+    history : :trunk = trunk.empty
+    first : :integer = 0
+    limit : :integer = 5000
+    main : :any = ()
+    alt : :bool = false
+    x : :integer = 0
+    y : :integer = 0
+    wrap_next : :bool = false
+    pen : :integer = 0
+    top : :integer = 0
+    bottom : :integer = 23
+    saved : :any = ()
+    app_cursor : :bool = false
+    app_keypad : :bool = false
+    bracketed : :bool = false
+    autowrap : :bool = true
+    origin : :bool = false
+    insert : :bool = false
+    cursor_visible : :bool = true
+    cursor_shape : :atom = :block
+    mouse : :integer = 0
+    sgr_mouse : :bool = false
+    focus_events : :bool = false
+    dec : :bool = false
+    g1_dec : :bool = false
+    shifted : :bool = false
+    tabs : %{:integer => :bool} = %{}
+    title : :string = ""
+    cwd : :string = ""
+    last : :integer = 32
+    pending : :string = ""
+    replies : [:string] = []
+    events : [:any] = []
+    dirty : %{:integer => :bool} = %{}
+    reset : :bool = false
+    blank_row : :any = ()
+    window : :integer = 2000
+}
+
+/// A terminal `cols` by `rows`, empty, keeping `limit` lines of history.
+let new : :integer -> :integer -> :integer -> Term;
+let new cols rows limit = {
+    let b = blank cols 0;
+    Term.new () |> Term.set_cols cols |> Term.set_rows rows |> Term.set_limit limit |> Term.set_blank_row b
+        |> Term.set_bottom (rows - 1) |> Term.set_grid (run_of rows b) |> Term.set_reset true
+};
+
+/// The number of the line at the top of the screen.
+let base : Term -> :integer;
+let base t = Term.first t + trunk.length (Term.history t);
+
+/// Line `n`, from the history or the screen, or `()` for one gone or not yet there.
+let line : Term -> :integer -> :any;
+let line t n = {
+    let b = base t;
+    if n < Term.first t { () } else if n < b { trunk.at (n - Term.first t) (Term.history t) }
+    else if n < b + Term.rows t { trunk.at (n - b) (Term.grid t) } else { () }
+};
+
+/// Line `n`'s text, `""` for one there is not.
+let line_text : Term -> :integer -> :string;
+let line_text t n = match line t n { () => "", r => row_text r };
+
+/// The cursor as `[line, column]`.
+let cursor : Term -> [:integer];
+let cursor t = [base t + Term.y t, Term.x t];
+
+priv let touch y t = Term.set_dirty ((Term.dirty t).[base t + y => true]) t;
+priv let touch_all t = list.fold (fn acc y -> touch y acc) t (list.range 0 (Term.rows t));
+priv let row_at y t = trunk.at y (Term.grid t);
+priv let put_row y r t = touch y (Term.set_grid (trunk.set y r (Term.grid t)) t);
+priv let erase_style t = pen 0 0 (bg_of (Term.pen t));
+priv let event e t = Term.set_events (list.cons e (Term.events t)) t;
+priv let reply s t = Term.set_replies (list.cons s (Term.replies t)) t;
+
+/// What changed since the last time, and the terminal with it forgotten:
+/// `[lines, replies, events, reset, t]`, where `lines` is `[number, spans]`
+/// for each changed line still kept, `replies` what to write back to the
+/// program and `events` what happened, both oldest first, and `reset` that
+/// the window should forget every line from the top of the screen down.
+let take_updates : Term -> [:any];
+let take_updates t = {
+    // Only the lines a window keeps: a flood of output scrolls thousands of
+    // lines through between two frames, and drawing the ones already gone
+    // from the window's reach would be most of the work.
+    let oldest = base t + Term.rows t - Term.window t;
+    let numbers = list.sort (list.filter (fn n -> n >= oldest) (map.keys (Term.dirty t)));
+    let lines = list.flat_map (fn n -> match line t n { () => [], r => [[n, spans r]] }) numbers;
+    [lines, list.reverse (Term.replies t), list.reverse (Term.events t), Term.reset t,
+     t |> Term.set_dirty map.empty |> Term.set_replies [] |> Term.set_events [] |> Term.set_reset false]
+};
+
+// --- scrolling -------------------------------------------------------------------
+
+/// A blank row for this terminal, in the current background: the shared one
+/// when the background is the default, which is the usual case -- a row is a
+/// value, so one blank row can stand for every blank line on the screen.
+priv let blank_for t = if bg_of (Term.pen t) == 0 && Term.blank_row t != () { Term.blank_row t } else { blank (Term.cols t) (erase_style t) };
+
+/// The screen's region moved up `n` lines, blank ones coming in at its foot.
+/// The whole screen of the main buffer scrolls into the history; anything
+/// else -- a region, the alternate screen -- loses the lines it scrolls off.
+priv let scroll_up n t = if n <= 0 { t } else {
+    let top = Term.top t;
+    let bottom = Term.bottom t;
+    let span = bottom - top + 1;
+    let k = num.min n span;
+    let fresh = run_of k (blank_for t);
+    let g = Term.grid t;
+    if top == 0 && bottom == Term.rows t - 1 && not (Term.alt t) {
+        let history = trunk.concat (Term.history t) (trunk.take k g);
+        // Trimmed a tenth at a time, not a line at a time: dropping the
+        // front of a trunk is a copy, and a flood of output would make one
+        // for every line.
+        let over = trunk.length history - Term.limit t;
+        let cut = if over > num.max 64 (Term.limit t / 10) { over } else { 0 };
+        let moved = t |> Term.set_history (if cut > 0 { trunk.drop cut history } else { history })
+            |> Term.set_first (Term.first t + cut) |> Term.set_grid (trunk.concat (trunk.drop k g) fresh);
+        list.fold (fn acc y -> touch y acc) moved (list.range (Term.rows t - k) (Term.rows t))
+    } else {
+        let region = trunk.slice (top + k) (bottom + 1) g;
+        let g2 = trunk.concat (trunk.concat (trunk.take top g) (trunk.concat region fresh)) (trunk.drop (bottom + 1) g);
+        list.fold (fn acc y -> touch y acc) (Term.set_grid g2 t) (list.range top (bottom + 1))
+    }
+};
+
+/// The region moved down `n` lines, blank ones coming in at its head.
+priv let scroll_down n t = if n <= 0 { t } else {
+    let top = Term.top t;
+    let bottom = Term.bottom t;
+    let k = num.min n (bottom - top + 1);
+    let g = Term.grid t;
+    let region = trunk.slice top (bottom + 1 - k) g;
+    let g2 = trunk.concat (trunk.concat (trunk.take top g) (trunk.concat (run_of k (blank_for t)) region)) (trunk.drop (bottom + 1) g);
+    list.fold (fn acc y -> touch y acc) (Term.set_grid g2 t) (list.range top (bottom + 1))
+};
+
+/// Down a line, scrolling at the foot of the region.
+priv let linefeed t = if Term.y t == Term.bottom t { scroll_up 1 t }
+    else if Term.y t < Term.rows t - 1 { Term.set_y (Term.y t + 1) t } else { t };
+
+/// Up a line, scrolling back at the head of the region.
+priv let reverse_index t = if Term.y t == Term.top t { scroll_down 1 t }
+    else if Term.y t > 0 { Term.set_y (Term.y t - 1) t } else { t };
+
+// --- writing ---------------------------------------------------------------------
+
+/// Whether a code point takes two cells: the East Asian wide and fullwidth
+/// blocks and the emoji, by range -- what a terminal's font draws double.
+let wide : :integer -> :bool;
+let wide c = c >= 4352 && ((c <= 4447) || (c >= 11904 && c <= 42191 && c != 12351) || (c >= 44032 && c <= 55203)
+    || (c >= 63744 && c <= 64255) || (c >= 65040 && c <= 65049) || (c >= 65072 && c <= 65135)
+    || (c >= 65280 && c <= 65376) || (c >= 65504 && c <= 65510) || (c >= 127744 && c <= 128591)
+    || (c >= 128640 && c <= 128767) || (c >= 129280 && c <= 129791) || (c >= 131072 && c <= 262141));
+
+/// Whether a code point takes no cell: a combining mark, a joiner.
+priv let zero_width c = (c >= 768 && c <= 879) || (c >= 8203 && c <= 8207) || c == 65039 || (c >= 6832 && c <= 6911)
+    || (c >= 7616 && c <= 7679) || (c >= 8400 && c <= 8447) || (c >= 65056 && c <= 65071);
+
+/// DEC special graphics, the line-drawing set `ESC ( 0` selects.
+priv let dec_graphics c = if c < 96 || c > 126 { c } else {
+    list.nth (c - 96) [9670, 9618, 9225, 9228, 9229, 9226, 176, 177, 9252, 9227, 9496, 9488, 9484, 9492, 9532, 9146,
+        9147, 9472, 9148, 9149, 9500, 9508, 9524, 9516, 9474, 8804, 8805, 960, 8800, 163, 183]
+};
+
+/// The bytes of printable ASCII: text every one of which takes one cell.
+priv let ascii = str.of_chars (list.map char.of_code (list.range 32 127));
+
+/// The text `s` written at the cursor, wrapping at the right margin when
+/// that mode is on. Printable ASCII -- nearly all of what programs write --
+/// goes a run at a time: as much as fits on the line, put in with three
+/// slices of each trunk. Everything else goes a character at a time, since
+/// each may be wide, combining, or a line-drawing character.
+priv let print s t = {
+    let dec = if Term.shifted t { Term.g1_dec t } else { Term.dec t };
+    if not dec && not (Term.insert t) && str.span ascii 0 s == str.byte_length s { print_ascii (str.chars s) t }
+    else { print_each (list.map char.code (str.chars s)) dec t }
+};
+
+/// At the right margin with a character still to write: on to the next line
+/// when wrapping, the line marked as wrapped; otherwise the last cell again.
+priv let margin t w = if Term.autowrap t {
+    let done = put_row (Term.y t) (Row.set_wrapped true (row_at (Term.y t) t)) t;
+    linefeed (done |> Term.set_x 0 |> Term.set_wrap_next false)
+} else { t |> Term.set_x (Term.cols t - w) |> Term.set_wrap_next false };
+
+/// `put_row` with the row made first: a row left suspended would hold the
+/// one before it, and a flood of text would build a chain of them.
+priv let place_row y !row t = put_row y row t;
+
+priv let rec print_ascii cs !t = match cs {
+    [] => t,
+    _ => if Term.wrap_next t { print_ascii cs (margin t 1) } else {
+        let x = Term.x t;
+        let cols = Term.cols t;
+        let fits = list.take (cols - x) cs;
+        let k = len fits;
+        let row = write_run x fits (Term.pen t) (row_at (Term.y t) t);
+        let nx = x + k;
+        let placed = place_row (Term.y t) row t |> Term.set_last (char.code (list.last fits));
+        let moved = if nx >= cols { placed |> Term.set_x (cols - 1) |> Term.set_wrap_next true } else { Term.set_x nx placed };
+        print_ascii (list.drop k cs) moved
+    },
+};
+
+priv let rec print_each codes dec !t = match codes {
+    [] => t,
+    _ => {
+        let c0 = list.head codes;
+        let c = if dec { dec_graphics c0 } else { c0 };
+        if zero_width c { print_each (list.tail codes) dec t } else {
+            let w = if wide c { 2 } else { 1 };
+            let cols = Term.cols t;
+            if Term.wrap_next t || Term.x t + w > cols { print_each codes dec (margin t w) } else {
+                let x = Term.x t;
+                let style = Term.pen t;
+                let row = row_at (Term.y t) t;
+                let shifted = if Term.insert t {
+                    Row.make (trunk.take cols (trunk.concat (trunk.concat (trunk.take x (Row.cells row)) (run_of w ' ')) (trunk.drop x (Row.cells row))))
+                        (trunk.take cols (trunk.concat (trunk.concat (trunk.take x (Row.styles row)) (run_of w style)) (trunk.drop x (Row.styles row))))
+                        (num.min cols (Row.used row + w)) (Row.wrapped row)
+                } else { row };
+                let cells = if w == 2 { [char.of_code c, '\0'] } else { [char.of_code c] };
+                let written = write_run x cells style shifted;
+                let nx = x + w;
+                let placed = place_row (Term.y t) written t |> Term.set_last c;
+                print_each (list.tail codes) dec (if nx >= cols { placed |> Term.set_x (cols - 1) |> Term.set_wrap_next true } else { Term.set_x nx placed })
+            }
+        }
+    },
+};
+
+// --- erasing ---------------------------------------------------------------------
+
+/// Cells `[from, to)` of row `y` emptied, in the current background.
+priv let erase_cells y from to t = {
+    let r = row_at y t;
+    let a = num.max 0 from;
+    let b = num.min (Term.cols t) to;
+    if a >= b { t } else {
+        let n = b - a;
+        let e = erase_style t;
+        let cells = trunk.concat (trunk.concat (trunk.take a (Row.cells r)) (run_of n ' ')) (trunk.drop b (Row.cells r));
+        let styles = trunk.concat (trunk.concat (trunk.take a (Row.styles r)) (run_of n e)) (trunk.drop b (Row.styles r));
+        // Erasing to the end in the default background leaves nothing there.
+        let used = if b >= Term.cols t && e == 0 { num.min (Row.used r) a } else { num.max (Row.used r) (if e == 0 { 0 } else { b }) };
+        put_row y (Row.make cells styles used (if b >= Term.cols t { false } else { Row.wrapped r })) t
+    }
+};
+
+priv let erase_rows from to t = list.fold (fn acc y -> put_row y (blank_for t) acc) t (list.range from to);
+
+/// ED: below the cursor (0), above it (1), the screen (2), or the history (3).
+priv let erase_display mode t = match mode {
+    0 => erase_rows (Term.y t + 1) (Term.rows t) (erase_cells (Term.y t) (Term.x t) (Term.cols t) t),
+    1 => erase_rows 0 (Term.y t) (erase_cells (Term.y t) 0 (Term.x t + 1) t),
+    2 => erase_rows 0 (Term.rows t) t,
+    3 => t |> Term.set_first (base t) |> Term.set_history trunk.empty |> Term.set_reset true |> touch_all,
+    _ => t,
+};
+
+/// EL: to the right of the cursor (0), to its left (1), or the line (2).
+priv let erase_line mode t = match mode {
+    0 => erase_cells (Term.y t) (Term.x t) (Term.cols t) t,
+    1 => erase_cells (Term.y t) 0 (Term.x t + 1) t,
+    2 => erase_cells (Term.y t) 0 (Term.cols t) t,
+    _ => t,
+};
+
+/// ICH and DCH: `n` blank cells pushed in at the cursor, or `n` cells taken out.
+priv let insert_cells n t = {
+    let r = row_at (Term.y t) t;
+    let x = Term.x t;
+    let cols = Term.cols t;
+    let k = num.min n (cols - x);
+    put_row (Term.y t) (Row.make
+        (trunk.take cols (trunk.concat (trunk.concat (trunk.take x (Row.cells r)) (run_of k ' ')) (trunk.drop x (Row.cells r))))
+        (trunk.take cols (trunk.concat (trunk.concat (trunk.take x (Row.styles r)) (run_of k (erase_style t))) (trunk.drop x (Row.styles r))))
+        (num.min cols (Row.used r + k)) (Row.wrapped r)) t
+};
+priv let delete_cells n t = {
+    let r = row_at (Term.y t) t;
+    let x = Term.x t;
+    let cols = Term.cols t;
+    let k = num.min n (cols - x);
+    let e = erase_style t;
+    put_row (Term.y t) (Row.make
+        (trunk.concat (trunk.concat (trunk.take x (Row.cells r)) (trunk.drop (x + k) (Row.cells r))) (run_of k ' '))
+        (trunk.concat (trunk.concat (trunk.take x (Row.styles r)) (trunk.drop (x + k) (Row.styles r))) (run_of k e))
+        (if e == 0 { Row.used r } else { cols }) false) t
+};
+
+/// IL and DL: lines pushed in at the cursor's, or taken out, within the region.
+priv let insert_lines n t = if Term.y t < Term.top t || Term.y t > Term.bottom t { t } else {
+    let r = t |> Term.set_top (Term.y t) |> scroll_down n;
+    r |> Term.set_top (Term.top t) |> Term.set_x 0
+};
+priv let delete_lines n t = if Term.y t < Term.top t || Term.y t > Term.bottom t { t } else {
+    // Never into the history: the region starts at the cursor, not the top.
+    let saved_alt = Term.alt t;
+    let r = t |> Term.set_top (Term.y t) |> Term.set_alt true |> scroll_up n;
+    r |> Term.set_top (Term.top t) |> Term.set_alt saved_alt |> Term.set_x 0
+};
+
+// --- moving ----------------------------------------------------------------------
+
+priv let clamp_x x t = num.clamp 0 (Term.cols t - 1) x;
+priv let move_to x y t = {
+    let lo = if Term.origin t { Term.top t } else { 0 };
+    let hi = if Term.origin t { Term.bottom t } else { Term.rows t - 1 };
+    let row = num.clamp lo hi (if Term.origin t { y + Term.top t } else { y });
+    t |> Term.set_x (clamp_x x t) |> Term.set_y row |> Term.set_wrap_next false
+};
+priv let next_tab t = {
+    let x = Term.x t;
+    let stops = Term.tabs t;
+    let rec find c = if c >= Term.cols t - 1 { Term.cols t - 1 }
+        else if (map.is_empty stops && c % 8 == 0) || stops.[c else false] { c } else { find (c + 1) };
+    Term.set_x (find (x + 1)) t
+};
+
+// --- the alternate screen ----------------------------------------------------------
+
+/// To the alternate screen (`?1049h`, and `?47`/`?1047`), and back. The main
+/// screen is kept as it was and restored whole; the window is told to forget
+/// what it showed, since the same line numbers now hold other text.
+priv let enter_alt t = if Term.alt t { t } else {
+    t |> Term.set_main [Term.grid t, Term.x t, Term.y t, Term.pen t]
+      |> Term.set_grid (run_of (Term.rows t) (blank (Term.cols t) 0))
+      |> Term.set_alt true |> Term.set_reset true |> touch_all
+};
+priv let leave_alt t = if not (Term.alt t) { t } else {
+    let [grid, x, y, p] = Term.main t;
+    t |> Term.set_grid (trunk.of (list.map (fn r -> row_fit (Term.cols t) r) (trunk.to_list grid)))
+      |> Term.set_x (clamp_x x t) |> Term.set_y (num.min y (Term.rows t - 1)) |> Term.set_pen p
+      |> Term.set_alt false |> Term.set_main () |> Term.set_reset true |> touch_all
+};
+
+priv let save_cursor t = Term.set_saved (Saved.make (Term.x t) (Term.y t) (Term.pen t) (Term.dec t)) t;
+priv let restore_cursor t = match Term.saved t {
+    () => move_to 0 0 t,
+    s => t |> Term.set_x (clamp_x (Saved.x s) t) |> Term.set_y (num.min (Saved.y s) (Term.rows t - 1))
+        |> Term.set_pen (Saved.pen s) |> Term.set_dec (Saved.dec s) |> Term.set_wrap_next false,
+};
+
+/// RIS: everything as a new terminal of the same size has it, the history kept.
+priv let hard_reset t = {
+    let fresh = new (Term.cols t) (Term.rows t) (Term.limit t);
+    fresh |> Term.set_history (Term.history t) |> Term.set_first (Term.first t)
+        |> Term.set_title (Term.title t) |> Term.set_cwd (Term.cwd t) |> touch_all
+};
+
+// --- control characters ----------------------------------------------------------
+
+priv let control b t = match b {
+    7 => event [:bell] t,
+    8 => t |> Term.set_x (num.max 0 (Term.x t - 1)) |> Term.set_wrap_next false,
+    9 => next_tab t,
+    10 => linefeed t |> Term.set_wrap_next false,
+    11 => linefeed t |> Term.set_wrap_next false,
+    12 => linefeed t |> Term.set_wrap_next false,
+    13 => t |> Term.set_x 0 |> Term.set_wrap_next false,
+    14 => Term.set_shifted true t,
+    15 => Term.set_shifted false t,
+    _ => t,
+};
+
+// --- select graphic rendition ----------------------------------------------------
+
+/// SGR: the pen changed by the parameters, each `[number, subparameters]`.
+priv let rec sgr ps !s = match ps {
+    [] => s,
+    _ => {
+        let [p, subs] = list.head ps;
+        let rest = list.tail ps;
+        match p {
+            0 => sgr rest 0,
+            1 => sgr rest (with_flag true bold s),
+            2 => sgr rest (with_flag true dim s),
+            3 => sgr rest (with_flag true italic s),
+            4 => sgr rest (with_flag (subs == [] || list.head subs != 0) underline s),
+            5 => sgr rest (with_flag true blink s),
+            6 => sgr rest (with_flag true blink s),
+            7 => sgr rest (with_flag true inverse s),
+            8 => sgr rest (with_flag true hidden s),
+            9 => sgr rest (with_flag true strike s),
+            21 => sgr rest (with_flag true underline s),
+            22 => sgr rest (with_flag false dim (with_flag false bold s)),
+            23 => sgr rest (with_flag false italic s),
+            24 => sgr rest (with_flag false underline s),
+            25 => sgr rest (with_flag false blink s),
+            27 => sgr rest (with_flag false inverse s),
+            28 => sgr rest (with_flag false hidden s),
+            29 => sgr rest (with_flag false strike s),
+            39 => sgr rest (with_fg 0 s),
+            49 => sgr rest (with_bg 0 s),
+            38 => { let [c, more] = extended subs rest; sgr more (with_fg c s) },
+            48 => { let [c, more] = extended subs rest; sgr more (with_bg c s) },
+            _ => if p >= 30 && p <= 37 { sgr rest (with_fg (p - 29) s) }
+                 else if p >= 40 && p <= 47 { sgr rest (with_bg (p - 39) s) }
+                 else if p >= 90 && p <= 97 { sgr rest (with_fg (p - 81) s) }
+                 else if p >= 100 && p <= 107 { sgr rest (with_bg (p - 91) s) }
+                 else { sgr rest s },
+        }
+    },
+};
+
+/// `38`/`48`'s colour, from its subparameters (`38:2::r:g:b`) or the
+/// parameters after it (`38;5;n`, `38;2;r;g;b`): `[colour, what is left]`.
+priv let extended subs rest = {
+    let nums = if subs != [] { subs } else { list.map list.head rest };
+    let used = if subs != [] { 0 } else { -1 };
+    match nums {
+        [5, n, ..] => [1 + num.clamp 0 255 n, if used == 0 { rest } else { list.drop 2 rest }],
+        [2, a, b, c, d, ..] => if subs != [] && len subs >= 5 { [16777216 + num.clamp 0 255 b * 65536 + num.clamp 0 255 c * 256 + num.clamp 0 255 d, rest] }
+            else { [16777216 + num.clamp 0 255 a * 65536 + num.clamp 0 255 b * 256 + num.clamp 0 255 c, if used == 0 { rest } else { list.drop 4 rest }] },
+        [2, a, b, c] => [16777216 + num.clamp 0 255 a * 65536 + num.clamp 0 255 b * 256 + num.clamp 0 255 c, if used == 0 { rest } else { list.drop 4 rest }],
+        _ => [0, rest],
+    }
+};
+
+// --- control sequences -----------------------------------------------------------
+
+/// The parameters of a sequence: each `[number, subparameters]`, `-1` for one left out.
+priv let params text = if text == "" { [] } else {
+    list.map (fn piece -> {
+        let parts = str.split ":" piece;
+        let n = fn s -> match num.parse_int s { () => -1, v => v };
+        [n (list.head parts), list.map (fn s -> num.max 0 (n s)) (list.tail parts)]
+    }) (str.split ";" text)
+};
+priv let arg i default ps = if i >= len ps { default } else {
+    let v = list.head (list.nth i ps);
+    if v <= 0 { default } else { v }
+};
+priv let arg0 i ps = if i >= len ps { 0 } else { num.max 0 (list.head (list.nth i ps)) };
+
+/// The modes `CSI ? .. h` and `l` set and reset.
+priv let private_mode on n t = match n {
+    1 => Term.set_app_cursor on t,
+    6 => move_to 0 0 (Term.set_origin on t),
+    7 => Term.set_autowrap on t,
+    12 => t,
+    25 => Term.set_cursor_visible on t,
+    47 => if on { enter_alt t } else { leave_alt t },
+    1047 => if on { enter_alt t } else { leave_alt t },
+    1048 => if on { save_cursor t } else { restore_cursor t },
+    1049 => if on { enter_alt (save_cursor t) } else { restore_cursor (leave_alt t) },
+    1000 => Term.set_mouse (if on { 1000 } else { 0 }) t,
+    1002 => Term.set_mouse (if on { 1002 } else { 0 }) t,
+    1003 => Term.set_mouse (if on { 1003 } else { 0 }) t,
+    1004 => Term.set_focus_events on t,
+    1006 => Term.set_sgr_mouse on t,
+    2004 => Term.set_bracketed on t,
+    _ => t,
+};
+
+priv let csi marker text inter final t = {
+    let ps = params text;
+    let a = arg 0 1 ps;
+    match [marker, inter, final] {
+        ["", "", "@"] => insert_cells a t,
+        ["", "", "A"] => t |> Term.set_y (num.max (if Term.y t >= Term.top t { Term.top t } else { 0 }) (Term.y t - a)) |> Term.set_wrap_next false,
+        ["", "", "B"] => t |> Term.set_y (num.min (if Term.y t <= Term.bottom t { Term.bottom t } else { Term.rows t - 1 }) (Term.y t + a)) |> Term.set_wrap_next false,
+        ["", "", "C"] => t |> Term.set_x (clamp_x (Term.x t + a) t) |> Term.set_wrap_next false,
+        ["", "", "D"] => t |> Term.set_x (clamp_x (Term.x t - a) t) |> Term.set_wrap_next false,
+        ["", "", "E"] => move_to 0 (Term.y t + a) (Term.set_origin false t) |> Term.set_origin (Term.origin t),
+        ["", "", "F"] => move_to 0 (Term.y t - a) (Term.set_origin false t) |> Term.set_origin (Term.origin t),
+        ["", "", "G"] => t |> Term.set_x (clamp_x (a - 1) t) |> Term.set_wrap_next false,
+        ["", "", "`"] => t |> Term.set_x (clamp_x (a - 1) t) |> Term.set_wrap_next false,
+        ["", "", "H"] => move_to (arg 1 1 ps - 1) (a - 1) t,
+        ["", "", "f"] => move_to (arg 1 1 ps - 1) (a - 1) t,
+        ["", "", "I"] => list.fold (fn acc i -> next_tab acc) t (list.range 0 a),
+        ["", "", "J"] => erase_display (arg0 0 ps) t,
+        ["?", "", "J"] => erase_display (arg0 0 ps) t,
+        ["", "", "K"] => erase_line (arg0 0 ps) t,
+        ["?", "", "K"] => erase_line (arg0 0 ps) t,
+        ["", "", "L"] => insert_lines a t,
+        ["", "", "M"] => delete_lines a t,
+        ["", "", "P"] => delete_cells a t,
+        ["", "", "S"] => scroll_up a t,
+        ["", "", "T"] => scroll_down a t,
+        ["", "", "X"] => erase_cells (Term.y t) (Term.x t) (Term.x t + a) t,
+        ["", "", "Z"] => t |> Term.set_x (num.max 0 (((Term.x t - 1) / 8) * 8 - 8 * (a - 1))),
+        ["", "", "a"] => t |> Term.set_x (clamp_x (Term.x t + a) t),
+        ["", "", "b"] => print (str.of_chars (list.replicate (num.min a 4096) (char.of_code (Term.last t)))) t,
+        ["", "", "c"] => reply "\u{1b}[?62;22c" t,
+        [">", "", "c"] => reply "\u{1b}[>1;10;0c" t,
+        ["", "", "d"] => move_to (Term.x t) (a - 1) t,
+        ["", "", "e"] => move_to (Term.x t) (Term.y t + a) t,
+        ["", "", "g"] => match arg0 0 ps {
+            0 => Term.set_tabs ((Term.tabs t).[Term.x t => false]) t,
+            3 => Term.set_tabs (map.from_pairs (list.map (fn c -> [c, false]) (list.range 0 (Term.cols t)))) t,
+            _ => t,
+        },
+        ["", "", "h"] => if arg0 0 ps == 4 { Term.set_insert true t } else { t },
+        ["", "", "l"] => if arg0 0 ps == 4 { Term.set_insert false t } else { t },
+        ["?", "", "h"] => list.fold (fn acc p -> private_mode true (list.head p) acc) t ps,
+        ["?", "", "l"] => list.fold (fn acc p -> private_mode false (list.head p) acc) t ps,
+        ["", "", "m"] => Term.set_pen (sgr (if ps == [] { [[0, []]] } else { list.map (fn p -> [num.max 0 (list.head p), list.nth 1 p]) ps }) (Term.pen t)) t,
+        ["", "", "n"] => match arg0 0 ps {
+            5 => reply "\u{1b}[0n" t,
+            6 => reply ("\u{1b}[" + to_string (Term.y t + 1) + ";" + to_string (Term.x t + 1) + "R") t,
+            _ => t,
+        },
+        ["?", "", "n"] => if arg0 0 ps == 6 { reply ("\u{1b}[?" + to_string (Term.y t + 1) + ";" + to_string (Term.x t + 1) + "R") t } else { t },
+        ["", "", "r"] => {
+            let top = arg 0 1 ps - 1;
+            let bottom = arg 1 (Term.rows t) ps - 1;
+            if top < bottom && bottom < Term.rows t { move_to 0 0 (t |> Term.set_top top |> Term.set_bottom bottom) } else { t }
+        },
+        ["", "", "s"] => save_cursor t,
+        ["", "", "u"] => restore_cursor t,
+        ["", " ", "q"] => Term.set_cursor_shape (match arg0 0 ps { 3 => :underline, 4 => :underline, 5 => :bar, 6 => :bar, _ => :block }) t,
+        ["", "!", "p"] => t |> Term.set_pen 0 |> Term.set_insert false |> Term.set_origin false |> Term.set_autowrap true
+            |> Term.set_cursor_visible true |> Term.set_top 0 |> Term.set_bottom (Term.rows t - 1) |> Term.set_app_cursor false,
+        _ => t,
+    }
+};
+
+// --- operating system commands ---------------------------------------------------
+
+/// The text after `file://host` in an OSC 7 address, decoded.
+priv let path_of u = match str.split_once "://" u {
+    () => u,
+    [scheme, rest] => match str.find "/" rest { -1 => "/", i => url.decode (str.slice i (str.byte_length rest - i) rest) },
+};
+
+priv let osc text t = match str.split_once ";" text {
+    () => t,
+    [code, body] => match code {
+        "0" => event [:title, body] (Term.set_title body t),
+        "2" => event [:title, body] (Term.set_title body t),
+        "7" => { let p = path_of body; event [:cwd, p] (Term.set_cwd p t) },
+        "133" => {
+            let [kind, rest] = match str.split_once ";" body { () => [body, ""], kv => kv };
+            event [:mark, kind, rest, base t + Term.y t, Term.x t] t
+        },
+        "633" => match str.split_once ";" body {
+            ["E", command] => event [:command, unescape_633 command] t,
+            _ => t,
+        },
+        "1337" => if str.starts_with "CurrentDir=" body { let p = str.trim_prefix "CurrentDir=" body; event [:cwd, p] (Term.set_cwd p t) } else { t },
+        "10" => if body == "?" { reply "\u{1b}]10;rgb:dcdc/dcdc/e6e6\u{1b}\\" t } else { t },
+        "11" => if body == "?" { reply "\u{1b}]11;rgb:0f0f/0f0f/1414\u{1b}\\" t } else { t },
+        _ => t,
+    },
+};
+
+/// A command line as OSC 633 carries it: `\\` and `\xHH` escapes.
+priv let unescape_633 s = {
+    let rec go cs acc = match cs {
+        [] => str.of_chars (list.reverse acc),
+        ['\\', '\\', ..rest] => go rest (list.cons '\\' acc),
+        ['\\', 'x', a, b, ..rest] => match num.parse_base 16 (str.of_chars [a, b]) {
+            () => go rest acc,
+            n => go rest (list.cons (char.of_code n) acc),
+        },
+        _ => go (list.tail cs) (list.cons (list.head cs) acc),
+    };
+    go (str.chars s) []
+};
+
+// --- the parser ------------------------------------------------------------------
+
+/// The bytes that end a run of printable text: C0 controls and DEL.
+priv let controls = str.of_chars (list.map char.of_code (list.range 0 32)) + "\u{7f}";
+priv let param_bytes = "0123456789;:<=>?";
+priv let intermediate_bytes = " !\"#$%&'()*+,-./";
+/// How long an unfinished OSC or DCS may grow before it is thrown away.
+priv let max_string = 65536;
+
+/// Where the last whole UTF-8 character of `d` ends: an unfinished one at the
+/// end is left for the next piece.
+priv let utf8_end d = {
+    let n = str.byte_length d;
+    let rec back k = if k > 3 || k > n { n } else {
+        let b = str.byte (n - k) d;
+        if b < 128 { n }
+        else if b >= 192 {
+            let need = if b >= 240 { 4 } else if b >= 224 { 3 } else { 2 };
+            if need > k { n - k } else { n }
+        } else { back (k + 1) }
+    };
+    back 1
+};
+
+/// The terminal after the program wrote `bytes`.
+let feed : Term -> :string -> Term;
+let feed t bytes = {
+    let d = Term.pending t + bytes;
+    let n = utf8_end d;
+    let held = str.slice n (str.byte_length d - n) d;
+    let after = run (Term.set_pending "" t) d 0 n;
+    Term.set_pending (Term.pending after + held) after
+};
+
+priv let rec run !t d i n = if i >= n { t } else {
+    let b = str.byte i d;
+    if b >= 32 && b != 127 {
+        let j = str.upto controls i d;
+        let k = if j > n { n } else { j };
+        run (print (str.slice i (k - i) d) t) d k n
+    } else if b == 27 { escape t d i n }
+    else { run (control b t) d (i + 1) n }
+};
+
+/// Keep `d` from `i` for the next piece: the sequence there is unfinished.
+priv let hold t d i n = if n - i > max_string { t } else { Term.set_pending (str.slice i (n - i) d) t };
+
+priv let escape t d i n = if i + 1 >= n { hold t d i n } else {
+    let b = str.byte (i + 1) d;
+    match b {
+        91 => {
+            let start = i + 2;
+            let marker = if start < n && str.contains_str (str.slice start 1 d) "<=>?" { str.slice start 1 d } else { "" };
+            let p0 = if marker == "" { start } else { start + 1 };
+            let p1 = str.span param_bytes p0 d;
+            let p2 = str.span intermediate_bytes p1 d;
+            if p2 >= n { hold t d i n } else {
+                let final = str.slice p2 1 d;
+                let fb = str.byte p2 d;
+                if fb < 64 || fb > 126 { run t d (p2 + 1) n }
+                else { run (csi marker (str.slice p0 (p1 - p0) d) (str.slice p1 (p2 - p1) d) final t) d (p2 + 1) n }
+            }
+        },
+        93 => string_seq t d i n true,
+        80 => string_seq t d i n false,
+        95 => string_seq t d i n false,
+        94 => string_seq t d i n false,
+        88 => string_seq t d i n false,
+        40 => designate t d i n false,
+        41 => designate t d i n true,
+        42 => if i + 2 >= n { hold t d i n } else { run t d (i + 3) n },
+        43 => if i + 2 >= n { hold t d i n } else { run t d (i + 3) n },
+        35 => if i + 2 >= n { hold t d i n } else { run t d (i + 3) n },
+        37 => if i + 2 >= n { hold t d i n } else { run t d (i + 3) n },
+        _ => run (single b t) d (i + 2) n,
+    }
+};
+
+priv let designate t d i n g1 = if i + 2 >= n { hold t d i n } else {
+    let dec = str.byte (i + 2) d == 48;
+    run (if g1 { Term.set_g1_dec dec t } else { Term.set_dec dec t }) d (i + 3) n
+};
+
+/// OSC, DCS, APC, PM and SOS: a string up to BEL or ST. Only OSC's is read.
+priv let string_seq t d i n is_osc = {
+    let j = str.upto "\u{7}\u{1b}" (i + 2) d;
+    if j >= n { hold t d i n }
+    else if str.byte j d == 7 {
+        let body = str.slice (i + 2) (j - i - 2) d;
+        run (if is_osc { osc body t } else { t }) d (j + 1) n
+    } else if j + 1 >= n { hold t d i n }
+    else if str.byte (j + 1) d == 92 {
+        let body = str.slice (i + 2) (j - i - 2) d;
+        run (if is_osc { osc body t } else { t }) d (j + 2) n
+    } else {
+        // An ESC that is not ST ends the string without one, as xterm treats it.
+        run t d j n
+    }
+};
+
+priv let single b t = match b {
+    55 => save_cursor t,
+    56 => restore_cursor t,
+    68 => linefeed t,
+    69 => linefeed (Term.set_x 0 t),
+    77 => reverse_index t,
+    99 => hard_reset t,
+    61 => Term.set_app_keypad true t,
+    62 => Term.set_app_keypad false t,
+    72 => Term.set_tabs ((Term.tabs t).[Term.x t => true]) t,
+    _ => t,
+};
+
+// --- resizing --------------------------------------------------------------------
+
+/// The terminal at a new size. Rows are cut or padded, not reflowed; a screen
+/// that loses rows gives its top ones to the history, so the cursor's line
+/// stays on it; one that gains rows gains them at the foot.
+let resize : Term -> :integer -> :integer -> Term;
+let resize t cols rows = if cols == Term.cols t && rows == Term.rows t { t } else {
+    let fitted = trunk.of (list.map (fn r -> row_fit cols r) (trunk.to_list (Term.grid t)));
+    let have = Term.rows t;
+    let t1 = t |> Term.set_cols cols |> Term.set_grid fitted |> Term.set_blank_row (blank cols 0);
+    let t2 = if rows < have {
+        let cut = num.max 0 (Term.y t - (rows - 1));
+        let lift = if Term.alt t { t1 |> Term.set_grid (trunk.drop cut (Term.grid t1)) }
+            else { t1 |> Term.set_history (trunk.concat (Term.history t1) (trunk.take cut (Term.grid t1)))
+                      |> Term.set_grid (trunk.drop cut (Term.grid t1)) };
+        lift |> Term.set_grid (trunk.take rows (Term.grid lift)) |> Term.set_y (Term.y t - cut)
+    } else {
+        t1 |> Term.set_grid (trunk.concat (Term.grid t1) (trunk.of (list.map (fn i -> blank cols 0) (list.range 0 (rows - have)))))
+    };
+    let main = match Term.main t2 {
+        () => (),
+        [g, x, y, p] => [trunk.of (list.map (fn r -> row_fit cols r)
+            (list.take rows (list.append (trunk.to_list g) (list.map (fn i -> blank cols 0) (list.range 0 rows))))),
+            num.min x (cols - 1), num.min y (rows - 1), p],
+    };
+    t2 |> Term.set_rows rows |> Term.set_main main |> Term.set_top 0 |> Term.set_bottom (rows - 1)
+       |> Term.set_x (num.min (Term.x t2) (cols - 1)) |> Term.set_y (num.clamp 0 (rows - 1) (Term.y t2))
+       |> Term.set_wrap_next false |> Term.set_reset true |> touch_all
+};
+
+/// The text of lines `[from, to)`, a wrapped line joined to the next.
+let text_between : Term -> :integer -> :integer -> :string;
+let text_between t from to = {
+    let rows = list.flat_map (fn n -> match line t n { () => [], r => [r] }) (list.range from to);
+    str.concat_all (list.map (fn r -> row_text r + (if Row.wrapped r { "" } else { "\n" })) rows)
+};
+
+when test {
+    import std.test;
+    let screen t = list.map (fn y -> row_text (trunk.at y (Term.grid t))) (list.range 0 (Term.rows t));
+    let tests = [
+        test.case "text is written at the cursor and wraps" $({
+            let t = feed (new 5 3 100) "hello world";
+            test.eq! ["hello", " worl", "d"] (screen t)
+            test.eq! [2, 1] (cursor t)
+        }),
+        test.case "a newline at the foot scrolls into the history" $({
+            let t = feed (new 10 2 100) "one\r\ntwo\r\nthree";
+            test.eq! ["two", "three"] (screen t)
+            test.eq! ["one", 1] [line_text t 0, base t]
+        }),
+        test.case "colours and attributes become a style" $({
+            let t = feed (new 20 1 10) "\u{1b}[1;31mred\u{1b}[0m \u{1b}[38;5;196mx\u{1b}[48;2;1;2;3my";
+            let row = trunk.at 0 (Term.grid t);
+            test.eq! [["red", "var(--dw-ansi-1)", "", 1], [" ", "", "", 0], ["x", "#ff0000", "", 0], ["y", "#ff0000", "#010203", 0]] (spans row)
+        }),
+        test.case "the cursor moves and lines are erased" $({
+            let t = feed (new 10 3 10) "aaaa\r\nbbbb\r\ncccc\u{1b}[2;3H\u{1b}[K\u{1b}[1;1H\u{1b}[2P";
+            test.eq! ["aa", "bb", "cccc"] (screen t)
+        }),
+        test.case "a sequence split across pieces is finished by the next" $({
+            let t = feed (feed (new 10 1 10) "a\u{1b}[3") "1mb";
+            test.eq! [["a", "", "", 0], ["b", "var(--dw-ansi-1)", "", 0]] (spans (trunk.at 0 (Term.grid t)))
+        }),
+        test.case "a UTF-8 character split across pieces is whole" $({
+            let snow = "\u{2603}";
+            let a = str.slice 0 2 snow;
+            let b = str.slice 2 1 snow;
+            test.eq! ["\u{2603}"] (screen (feed (feed (new 4 1 10) a) b) |> list.map str.trim)
+        }),
+        test.case "the alternate screen keeps the main one" $({
+            let t = feed (new 10 2 10) "shell$ \u{1b}[?1049h\u{1b}[Hvim\u{1b}[?1049l";
+            test.eq! ["shell$", ""] (list.map str.trim (screen t))
+            test.eq! [0, 7] (cursor t)
+        }),
+        test.case "a scroll region scrolls alone" $({
+            let t = feed (new 5 4 10) "1\r\n2\r\n3\r\n4\u{1b}[2;3r\u{1b}[3;1H\n";
+            test.eq! ["1", "3", "", "4"] (screen t)
+            test.eq! 0 (base t)
+        }),
+        test.case "line drawing draws lines" $(test.eq! ["\u{250c}\u{2500}\u{2510}"]
+            (screen (feed (new 3 1 10) "\u{1b}(0lqk\u{1b}(B"))),
+        test.case "the cursor's place is reported" $({
+            let [lines, replies, events, reset, t] = take_updates (feed (new 10 5 10) "ab\u{1b}[6n");
+            test.eq! ["\u{1b}[1;3R"] replies
+        }),
+        test.case "shell integration marks and the directory are events" $({
+            let [lines, replies, events, reset, t] = take_updates (feed (new 20 2 10)
+                "\u{1b}]133;A\u{7}$ \u{1b}]133;B\u{7}ls\u{1b}]633;E;ls -la\u{7}\u{1b}]7;file://host/home/me%20x\u{1b}\\\u{1b}]133;D;1\u{7}");
+            test.eq! [[:mark, "A", "", 0, 0], [:mark, "B", "", 0, 2], [:command, "ls -la"], [:cwd, "/home/me x"], [:mark, "D", "1", 0, 4]] events
+        }),
+        test.case "only changed lines are reported, and then forgotten" $({
+            let [l1, _, _, _, t1] = take_updates (new 10 3 10);
+            let [l2, _, _, _, t2] = take_updates (feed t1 "\u{1b}[2;1Hx");
+            let [l3, _, _, _, _] = take_updates t2;
+            test.eq! [0, [[1, [["x", "", "", 0]]]], []] [len l1, l2, l3]
+        }),
+        test.case "wide characters take two cells" $({
+            let t = feed (new 6 1 10) "\u{4e2d}\u{6587}ab";
+            test.eq! [[0, 6], "\u{4e2d}\u{6587}ab"] [cursor t |> (fn c -> [list.head c, list.nth 1 c + 1]), row_text (trunk.at 0 (Term.grid t))]
+        }),
+        test.case "a smaller window gives its top lines to the history" $({
+            let t = resize (feed (new 5 4 10) "1\r\n2\r\n3\r\n4") 5 2;
+            test.eq! [["3", "4"], 2, [3, 1]] [screen t, base t, cursor t]
+        }),
+        test.case "colours are CSS" $(test.eq! ["", "var(--dw-ansi-9)", "#5f87af", "#808080", "#0a0b0c"]
+            [css_colour 0, css_colour 10, css_colour (1 + 67), css_colour (1 + 244), css_colour (16777216 + 10 * 65536 + 11 * 256 + 12)]),
+    ];
+}

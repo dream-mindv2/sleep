@@ -1,0 +1,160 @@
+// Keys as a terminal sends them, and chords as a person writes them.
+//
+// A key the window hears is the page's key map (`%{"key", "code", "ctrl",
+// "alt", "shift", "meta"}`), and what the program on the terminal must be
+// sent is bytes: a letter is itself, Ctrl-C is byte 3, an arrow is `ESC [ A`
+// -- or `ESC O A` when the program asked for application cursor keys, which
+// is how vim and less tell a movement key from the same bytes typed -- and a
+// modified one says its modifiers in xterm's way, `ESC [ 1 ; 5 A` for
+// Ctrl-Up. `bytes` is that table.
+//
+// A chord is a shortcut written the way it is shown and set in Settings,
+// `"Ctrl+Shift+T"`; `chord` is the one a key map makes, so matching a key
+// against a setting is comparing two strings.
+import std.char;
+import std.list;
+import std.str;
+
+/// What `k` says of a modifier.
+priv let held name k = k.[name else false] == true;
+
+/// The key as a chord: its modifiers in a fixed order, then the key, a letter
+/// in capitals -- `"Ctrl+Shift+T"`, `"Alt+Enter"`, `"F5"`, `"Ctrl+,"`.
+let chord : :any -> :string;
+let chord k = {
+    let key = k.["key" else ""];
+    let name = if str.length key == 1 { str.upper key } else if key == " " { "Space" } else { key };
+    let shown = if name == " " { "Space" } else { name };
+    str.join_str "+" (list.append (list.filter (fn s -> s != "") [
+        if held "ctrl" k { "Ctrl" } else { "" },
+        if held "alt" k { "Alt" } else { "" },
+        if held "shift" k && str.length key != 1 { "Shift" } else if held "shift" k && char.is_alpha (str.first_or ' ' key) { "Shift" } else { "" },
+        if held "meta" k { "Meta" } else { "" },
+    ]) [shown])
+};
+
+/// A chord in the canonical spelling `chord` makes: `"ctrl+shift+t"` and
+/// `"Shift+Ctrl+T"` are both `"Ctrl+Shift+T"`.
+let canonical : :string -> :string;
+let canonical s = {
+    let parts = str.split "+" (str.trim s);
+    let mods = list.map str.lower (list.take (len parts - 1) parts);
+    let key = list.last parts;
+    let shown = if str.length key == 1 { str.upper key } else { capitalize key };
+    str.join_str "+" (list.append (list.filter (fn m -> m != "") [
+        if list.contains "ctrl" mods || list.contains "control" mods { "Ctrl" } else { "" },
+        if list.contains "alt" mods || list.contains "option" mods { "Alt" } else { "" },
+        if list.contains "shift" mods { "Shift" } else { "" },
+        if list.contains "meta" mods || list.contains "cmd" mods || list.contains "super" mods { "Meta" } else { "" },
+    ]) [shown])
+};
+
+priv let capitalize s = match str.lower s {
+    "esc" => "Escape", "escape" => "Escape", "enter" => "Enter", "return" => "Enter", "tab" => "Tab",
+    "space" => "Space", "backspace" => "Backspace", "delete" => "Delete", "del" => "Delete", "insert" => "Insert",
+    "home" => "Home", "end" => "End", "pageup" => "PageUp", "pagedown" => "PageDown",
+    "up" => "ArrowUp", "down" => "ArrowDown", "left" => "ArrowLeft", "right" => "ArrowRight",
+    "arrowup" => "ArrowUp", "arrowdown" => "ArrowDown", "arrowleft" => "ArrowLeft", "arrowright" => "ArrowRight",
+    other => if str.starts_with "f" other && str.length other <= 3 { str.upper other } else { s },
+};
+
+priv let esc = "\u{1b}";
+
+/// xterm's modifier parameter: 1, plus 1 for Shift, 2 for Alt, 4 for Ctrl.
+priv let modifier k = 1 + (if held "shift" k { 1 } else { 0 }) + (if held "alt" k { 2 } else { 0 }) + (if held "ctrl" k { 4 } else { 0 });
+
+/// A cursor or editing key: `ESC [ final`, `ESC O final` in application mode,
+/// `ESC [ 1 ; m final` with modifiers.
+priv let cursor_key final app k = {
+    let m = modifier k;
+    if m > 1 { esc + "[1;" + to_string m + final } else if app { esc + "O" + final } else { esc + "[" + final }
+};
+/// A key sent as `ESC [ n ~`, `ESC [ n ; m ~` with modifiers.
+priv let tilde n k = {
+    let m = modifier k;
+    if m > 1 { esc + "[" + to_string n + ";" + to_string m + "~" } else { esc + "[" + to_string n + "~" }
+};
+
+/// What a key sends to the program, `""` for a key that sends nothing.
+/// `app_cursor` is the terminal's application cursor mode.
+let bytes : :any -> :bool -> :string;
+let bytes k app_cursor = {
+    let key = k.["key" else ""];
+    let ctrl = held "ctrl" k;
+    let alt = held "alt" k;
+    let prefix = if alt { esc } else { "" };
+    match key {
+        "Enter" => prefix + "\r",
+        "Backspace" => prefix + (if ctrl { "\u{8}" } else { "\u{7f}" }),
+        "Tab" => if held "shift" k { esc + "[Z" } else { prefix + "\t" },
+        "Escape" => prefix + esc,
+        "ArrowUp" => cursor_key "A" app_cursor k,
+        "ArrowDown" => cursor_key "B" app_cursor k,
+        "ArrowRight" => cursor_key "C" app_cursor k,
+        "ArrowLeft" => cursor_key "D" app_cursor k,
+        "Home" => cursor_key "H" app_cursor k,
+        "End" => cursor_key "F" app_cursor k,
+        "Insert" => tilde 2 k,
+        "Delete" => tilde 3 k,
+        "PageUp" => tilde 5 k,
+        "PageDown" => tilde 6 k,
+        "F1" => cursor_key "P" true k,
+        "F2" => cursor_key "Q" true k,
+        "F3" => cursor_key "R" true k,
+        "F4" => cursor_key "S" true k,
+        "F5" => tilde 15 k,
+        "F6" => tilde 17 k,
+        "F7" => tilde 18 k,
+        "F8" => tilde 19 k,
+        "F9" => tilde 20 k,
+        "F10" => tilde 21 k,
+        "F11" => tilde 23 k,
+        "F12" => tilde 24 k,
+        _ => if str.length key != 1 { "" } else if ctrl { prefix + control_of key } else if held "meta" k { "" } else { prefix + key },
+    }
+};
+
+/// Ctrl and a key: a letter's place in the alphabet, and the punctuation
+/// that has a control code of its own.
+priv let control_of key = {
+    let c = char.code (str.first_or ' ' (str.lower key));
+    if c >= 97 && c <= 122 { str.of_chars [char.of_code (c - 96)] }
+    else { match key {
+        " " => str.of_chars [char.of_code 0], "@" => str.of_chars [char.of_code 0], "2" => str.of_chars [char.of_code 0],
+        "[" => esc, "3" => esc, "\\" => "\u{1c}", "4" => "\u{1c}", "]" => "\u{1d}", "5" => "\u{1d}",
+        "^" => "\u{1e}", "6" => "\u{1e}", "_" => "\u{1f}", "-" => "\u{1f}", "7" => "\u{1f}", "/" => "\u{1f}",
+        "8" => "\u{7f}", "?" => "\u{7f}",
+        _ => key,
+    } }
+};
+
+/// Pasted text as it is typed into the program: line endings as Enter, and
+/// with no escape characters, so a paste cannot end bracketed paste early or
+/// smuggle a sequence in; wrapped in the bracketed-paste markers when the
+/// program asked for them, so a shell takes a pasted command as text rather
+/// than running each line as it arrives.
+let paste : :string -> :bool -> :string;
+let paste text bracketed = {
+    let clean = str.replace "\u{1b}" "" (str.replace "\r\n" "\r" (str.replace "\n" "\r" (str.replace "\r\n" "\n" text)));
+    if bracketed { esc + "[200~" + clean + esc + "[201~" } else { clean }
+};
+
+when test {
+    import std.test;
+    let key = fn name -> %{ "key" => name };
+    let tests = [
+        test.case "letters are themselves, and Ctrl makes control codes" $(test.eq! ["a", "\u{3}", "\u{1b}x", "\u{0}"]
+            [bytes (key "a") false, bytes %{"key" => "c", "ctrl" => true} false, bytes %{"key" => "x", "alt" => true} false,
+             bytes %{"key" => " ", "ctrl" => true} false]),
+        test.case "arrows follow the cursor mode and say their modifiers" $(test.eq! ["\u{1b}[A", "\u{1b}OA", "\u{1b}[1;5C"]
+            [bytes (key "ArrowUp") false, bytes (key "ArrowUp") true, bytes %{"key" => "ArrowRight", "ctrl" => true} true]),
+        test.case "editing and function keys" $(test.eq! ["\u{7f}", "\u{1b}[3~", "\u{1b}[Z", "\u{1b}OP", "\u{1b}[15~", "\r"]
+            [bytes (key "Backspace") false, bytes (key "Delete") false, bytes %{"key" => "Tab", "shift" => true} false,
+             bytes (key "F1") false, bytes (key "F5") false, bytes (key "Enter") false]),
+        test.case "a chord is written one way" $(test.eq! ["Ctrl+Shift+T", "Ctrl+Shift+T", "Alt+Enter", "Ctrl+,", "F5"]
+            [chord %{"key" => "T", "ctrl" => true, "shift" => true}, canonical "shift+ctrl+t",
+             chord %{"key" => "Enter", "alt" => true}, chord %{"key" => ",", "ctrl" => true}, chord (key "F5")]),
+        test.case "a paste is bracketed and cannot escape" $(test.eq! "\u{1b}[200~ls\rpwd[201~\u{1b}[201~"
+            (paste "ls\npwd\u{1b}[201~" true)),
+    ];
+}

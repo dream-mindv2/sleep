@@ -1,0 +1,404 @@
+// One terminal tab, in the backend: the shell on its pseudo-terminal, the
+// terminal that reads what it writes, and what the window is told.
+//
+// **Two processes.** A reader waits on the terminal (`pty.read!` parks it,
+// not a worker) and sends each piece it gets to the session, which owns
+// everything else and reads its mailbox: output, keystrokes from the window,
+// a resize, a command to queue. So typing is never stuck behind a flood of
+// output, and nothing here is shared.
+//
+// **The window is told at most every 8 ms.** Output is fed to the terminal
+// as it arrives, but the lines it changed are sent only when the session has
+// been quiet for a moment or 8 ms have passed since the last frame -- a
+// burst of a thousand pieces is one frame, and an `ls` is on the screen
+// within one frame of the shell writing it. A frame larger than the window's
+// message limit is cut in pieces.
+//
+// **Blocks.** With shell integration the shell marks each prompt and command
+// (`shell.dr`), and the session turns the marks into blocks -- a command, its
+// directory, where its output starts and ends, how it ended and how long it
+// took -- which the window draws in the gutter and the assistant learns from.
+// The marks are also how the session knows the shell is waiting for a command
+// (the queue runs the next one then; a risky one is held for confirmation on
+// Enter) and what has been typed at the prompt so far (what autosuggestion
+// completes).
+import std.console;
+import std.file;
+import std.graphics.backend;
+import std.io;
+import std.json;
+import std.list;
+import std.map;
+import std.num;
+import std.os;
+import std.path;
+import std.proc;
+import std.pty;
+import std.str;
+import std.time;
+import history.{Entry};
+import risk;
+import shell;
+import term.{Term};
+import term;
+
+/// Where the shell is: `idle` before integration has said anything,
+/// `prompt` while it waits for a command (typing starts at line `line`,
+/// column `col`), `running` once one has started.
+union Phase {
+    idle
+    prompt(line : :integer, col : :integer)
+    running(command : :string, prompt : :integer, line : :integer, started : :integer, cwd : :string)
+}
+
+/// What a session needs to start.
+mapping Start {
+    id : :string = ""
+    cols : :integer = 80
+    rows : :integer = 24
+    cwd : :string = ""
+    shell : :string = ""
+    integration : :bool = true
+    scrollback : :integer = 5000
+    autosuggest : :bool = true
+    risk_guard : :bool = true
+}
+
+mapping State {
+    id : :string = ""
+    t : Term = Term.new ()
+    pty : :any = ()
+    events : :any = ()
+    assist : :any = ()
+    phase : Phase = Phase.idle
+    integrated : :bool = false
+    pending : :bool = false
+    due : :integer = 0
+    marks : %{:integer => :string} = %{}
+    fresh_marks : [[:any]] = []
+    queue : [:string] = []
+    recent : [:string] = []
+    command_text : :string = ""
+    typed : :string = ""
+    ghost : :string = ""
+    asked : :string = ""
+    allowed : %{:string => :integer} = %{}
+    autosuggest : :bool = true
+    risk_guard : :bool = true
+    title : :string = ""
+    cwd : :string = ""
+    last_poll : :integer = 0
+    done : :bool = false
+    exit : :any = ()
+}
+
+priv let now_ms! u = time.to_milliseconds (time.now! ());
+priv let clock_ms! u = time.monotonic! () / 1000000;
+priv let emit! s name value = backend.emit! (State.events s) name value;
+
+/// Start a session's processes and answer the session's.
+let start! : Start -> :any -> :any -> :process;
+let start! opts events assist = {
+    let program = if Start.shell opts == "" { pty.shell! () } else { Start.shell opts };
+    let [args, env] = if Start.integration opts { shell.prepare! program } else { [[], []] };
+    let dir = if Start.cwd opts != "" && io.is_dir! (Start.cwd opts) { Start.cwd opts }
+        else { match path.home! () { () => "", h => h } };
+    let p = pty.spawn! (pty.Options.new () |> pty.Options.set_program program |> pty.Options.set_args args
+        |> pty.Options.set_env (list.append env ["COLORTERM=truecolor", "TERM_PROGRAM=sleep", "TERM_PROGRAM_VERSION=0.1.0"])
+        |> pty.Options.set_dir dir |> pty.Options.set_cols (Start.cols opts) |> pty.Options.set_rows (Start.rows opts));
+    let state = State.new () |> State.set_id (Start.id opts) |> State.set_pty p |> State.set_events events |> State.set_assist assist
+        |> State.set_t (term.new (Start.cols opts) (Start.rows opts) (Start.scrollback opts))
+        |> State.set_autosuggest (Start.autosuggest opts) |> State.set_risk_guard (Start.risk_guard opts) |> State.set_cwd dir;
+    let session = spawn! $( guarded! state );
+    let reader = spawn! $( read_loop! p session );
+    session
+};
+
+/// The session, and what the window is told if it fails: nothing else waits
+/// on it, so a failure would otherwise leave a tab that never draws again and
+/// a shell nobody reads. The tab is closed as if the shell had ended, and the
+/// reader is let go: it is waiting for its last piece to be taken, and once
+/// the terminal is closed its next read is the end.
+priv let guarded! state = try! { run! state } catch e {
+    console.error! ("sleep: a terminal session failed: " + to_string e)
+    try! { pty.close! (State.pty state) } catch e2 { () }
+    emit! state "exit" %{ "id" => State.id state, "code" => -1 }
+    release! ()
+};
+
+priv let rec release! u = match proc.recv_within! 2000 {
+    Result.ok(m) => match m {
+        [:data, _, reader] => { send! reader :taken; release! () },
+        [:eof] => (),
+        _ => release! (),
+    },
+    Result.error(_) => (),
+};
+
+/// The reader: each piece the shell writes, to the session, then `:eof`.
+///
+/// It waits for the session to take each piece before reading the next,
+/// which is flow control: a program writing faster than the terminal can
+/// read fills the kernel's buffer and is made to wait, as on any terminal,
+/// instead of the session's mailbox filling with output that a keystroke --
+/// Ctrl-C above all -- would have to wait behind. Pieces are at most 16 KiB,
+/// so a frame is never far away while a flood is read.
+priv let rec read_loop! p session = match try! { io.read! (pty.Pty.handle p) 16384 } catch e { console.error! ("sleep: reading the terminal: " + to_string e); "" } {
+    "" => send! session [:eof],
+    chunk => {
+        send! session [:data, chunk, self! ()]
+        let rec taken! u = match recv! () { :taken => (), _ => taken! () };
+        taken! ()
+        read_loop! p session
+    },
+};
+
+/// The session's loop: a message, or the moment the next frame is due.
+priv let rec run! !s = if State.done s { () } else {
+    let wait = if State.pending s { num.max 0 (State.due s - clock_ms! ()) }
+        else if State.queue s != [] && not (State.integrated s) { 500 } else { 1000 };
+    let next = match proc.recv_within! wait {
+        Result.error(_) => tick! s,
+        Result.ok(m) => handle! m s,
+    };
+    run! next
+};
+
+priv let handle! m s = match m {
+    [:data, chunk, reader] => {
+        send! reader :taken
+        // Fed now, not when the next frame reads it: stored unforced, each
+        // piece would be a suspension holding the state before it, and a
+        // flood a chain as long as the flood.
+        let t = term.feed (State.t s) chunk;
+        strict! t
+        let fed = State.set_t t s;
+        let now = clock_ms! ();
+        // A frame is due 8 ms after output started arriving, whether or not
+        // more keeps coming: the wait for a quiet mailbox would otherwise
+        // last as long as the flood, and the screen stand still through it.
+        if not (State.pending fed) { fed |> State.set_pending true |> State.set_due (now + 8) }
+        else if now >= State.due fed { flush! fed } else { fed }
+    },
+    [:eof] => finish! s,
+    [:write, data, force] => write! data force s,
+    [:resize, cols, rows] => {
+        try! { pty.resize! (State.pty s) cols rows } catch e { () }
+        flush! (State.set_t (term.resize (State.t s) cols rows) s)
+    },
+    [:queue, command] => {
+        let q = State.set_queue (list.append (State.queue s) [command]) s;
+        emit! q "queue" %{ "id" => State.id q, "queue" => State.queue q }
+        run_queue! q
+    },
+    [:unqueue, index] => {
+        let q = State.set_queue (list.flat_map (fn p -> if list.head p == index { [] } else { [list.nth 1 p] })
+            (list.map_indexed (fn i c -> [i, c]) (State.queue s))) s;
+        emit! q "queue" %{ "id" => State.id q, "queue" => State.queue q }
+        q
+    },
+    [:allow, command] => State.set_allowed (map.update_strict 0 (fn n -> n + 1) (str.trim command) (State.allowed s)) s,
+    [:ghost, typed, suffix] => if typed == State.typed s && suffix != State.ghost s {
+        let g = State.set_ghost suffix s;
+        emit! g "ghost" %{ "id" => State.id g, "ghost" => suffix }
+        g
+    } else { s },
+    [:text, from, to, reply] => { send! reply [:text, term.text_between (State.t s) from to]; s },
+    [:settings, autosuggest, guard] => s |> State.set_autosuggest autosuggest |> State.set_risk_guard guard,
+    [:signal, name] => { try! { pty.signal! (State.pty s) name } catch e { () }; s },
+    [:close] => {
+        try! { pty.close! (State.pty s) } catch e { () }
+        State.set_done true s
+    },
+    _ => s,
+};
+
+/// A frame now if one is due, and the slower checks of the title and queue.
+priv let tick! s = {
+    let f = if State.pending s { flush! s } else { s };
+    let now = clock_ms! ();
+    if now - State.last_poll f < 1000 { f } else { run_queue! (poll! (State.set_last_poll now f)) }
+};
+
+/// The title and directory from the program in the foreground, where the
+/// shell has not said them: its name, from `/proc`, and its directory.
+priv let poll! s = match try! { pty.foreground! (State.pty s) } catch e { Option.none } {
+    Option.none => s,
+    Option.some(pid) => {
+        let comm = match try! { file.read! ("/proc/" + to_string pid + "/comm") } catch e { () } { () => "", c => str.trim c };
+        let cwd = if State.integrated s { State.cwd s } else { try! { io.read_link! ("/proc/" + to_string pid + "/cwd") } catch e { State.cwd s } };
+        let title = if Term.title (State.t s) != "" { Term.title (State.t s) } else { comm };
+        if title == State.title s && cwd == State.cwd s { s } else {
+            let n = s |> State.set_title title |> State.set_cwd cwd;
+            emit! n "status" %{ "id" => State.id n, "title" => title, "cwd" => cwd, "program" => comm }
+            n
+        }
+    },
+};
+
+// --- typing --------------------------------------------------------------------------
+
+/// What has been typed at the prompt: the cursor's line from where typing began.
+priv let typed_now s = match State.phase s {
+    Phase.prompt(line, col) => {
+        let [cl, cx] = term.cursor (State.t s);
+        if cl != line || cx <= col { "" } else {
+            // To the cursor, not to the end of the line: the spaces typed so
+            // far are part of it, and what follows the cursor is not.
+            let chars = str.chars (term.line_text (State.t s) line);
+            let padded = list.append chars (list.replicate (num.max 0 (cx - len chars)) ' ');
+            str.of_chars (list.take (cx - col) (list.drop col padded))
+        }
+    },
+    _ => "",
+};
+
+/// The window's keys, to the shell -- unless it is Enter on a command the
+/// risk model says to ask about first, which is held and the window asked.
+priv let write! data force s = {
+    let holding = not force && State.risk_guard s && str.contains_str "\r" data && match State.phase s { Phase.prompt(_, _) => true, _ => false };
+    let command = if holding { typed_now s } else { "" };
+    let verdict = if holding && command != "" { risk.check command (State.allowed s) } else { [false, 0.0, []] };
+    if list.head verdict {
+        emit! s "risk" %{ "id" => State.id s, "command" => command, "p" => list.nth 1 verdict, "reasons" => list.nth 2 verdict }
+        s
+    } else {
+        let allowed = if force && command == "" { typed_now s } else { "" };
+        let s2 = if force && allowed != "" { State.set_allowed (map.update_strict 0 (fn n -> n + 1) (str.trim allowed) (State.allowed s)) s } else { s };
+        try! { pty.write! (State.pty s2) data } catch e { () }
+        State.set_ghost "" s2
+    }
+};
+
+/// The next queued command, typed, when the shell is waiting for one: at its
+/// prompt with nothing typed, or -- with no integration to say -- when the
+/// shell itself is in the foreground again.
+priv let run_queue! s = match State.queue s {
+    [] => s,
+    [next, ..rest] => {
+        let ready = if State.integrated s {
+            match State.phase s { Phase.prompt(_, _) => typed_now s == "", _ => false }
+        } else { match try! { pty.foreground! (State.pty s) } catch e { Option.none } {
+            Option.some(group) => group == pty.Pty.pid (State.pty s), Option.none => false } };
+        if not ready { s } else {
+            try! { pty.write! (State.pty s) (next + "\r") } catch e { () }
+            let n = State.set_queue rest s;
+            emit! n "queue" %{ "id" => State.id n, "queue" => rest, "started" => next }
+            n
+        }
+    },
+};
+
+// --- frames ----------------------------------------------------------------------------
+
+/// What the terminal changed, to the window; what the program must be told,
+/// to it; and what the shell's marks mean, to the session.
+priv let flush! s = {
+    let [lines, replies, events, reset, t] = term.take_updates (State.t s);
+    if replies != [] { try! { pty.write! (State.pty s) (str.concat_all replies) } catch e { () } }
+    let marked = list.fold (fn acc e -> on_event! e acc) (State.set_t t s) events;
+    let typed = typed_now marked;
+    let asked = if State.autosuggest marked && typed != State.typed marked && State.assist marked != () {
+        send! (State.assist marked) [:complete, self! (), typed, State.recent marked]
+        true
+    } else { false };
+    let ghost = if typed != State.typed marked { "" } else { State.ghost marked };
+    let n = marked |> State.set_typed typed |> State.set_ghost ghost |> State.set_pending false;
+    send_frame! n lines reset
+    let sent = State.set_fresh_marks [] n;
+    if list.any (fn e -> list.head e == :mark && list.nth 1 e == "B") events { run_queue! sent } else { sent }
+};
+
+priv let screen_of s lines reset = {
+    let t = State.t s;
+    %{
+        "id" => State.id s, "lines" => lines, "reset" => reset, "base" => term.base t, "first" => Term.first t,
+        "rows" => Term.rows t, "cols" => Term.cols t, "cursor" => term.cursor t, "cursor_visible" => Term.cursor_visible t,
+        "cursor_shape" => match Term.cursor_shape t { :bar => "bar", :underline => "underline", _ => "block" },
+        "app_cursor" => Term.app_cursor t, "bracketed" => Term.bracketed t, "alt" => Term.alt t,
+        "marks" => list.reverse (State.fresh_marks s), "ghost" => State.ghost s, "typed" => State.typed s,
+        "running" => match State.phase s {
+            Phase.running(c, prompt, line, started, cwd) => %{ "command" => c, "line" => prompt, "started" => started },
+            _ => (),
+        },
+    }
+};
+
+/// A frame, cut in pieces that each fit in a message, the last carrying the cursor.
+priv let send_frame! s lines reset = {
+    let rec pieces ls acc size out = match ls {
+        [] => list.reverse (if acc == [] && out != [] { out } else { list.cons (list.reverse acc) out }),
+        _ => {
+            let l = list.head ls;
+            let n = str.byte_length (json.encode l);
+            if size + n > 600000 && acc != [] { pieces ls [] 0 (list.cons (list.reverse acc) out) }
+            else { pieces (list.tail ls) (list.cons l acc) (size + n) out }
+        },
+    };
+    let parts = pieces lines [] 0 [];
+    list.each! (fn ip -> emit! s "screen" (screen_of s (list.nth 1 ip) (reset && list.head ip == 0))) (list.enumerate parts)
+};
+
+/// A mark, the directory, the title, the bell: what they do to the session.
+priv let on_event! e s = match e {
+    [:mark, "A", _, line, _] => s |> State.set_integrated true,
+    [:mark, "B", _, line, col] => s |> State.set_integrated true |> State.set_phase (Phase.prompt line col),
+    [:mark, "C", _, line, col] => {
+        let typed = typed_now s;
+        let command = if State.command_text s != "" { State.command_text s } else { typed };
+        // The shell says C once Enter's newline is out, so the output starts
+        // on the cursor's line, and the prompt is where typing began.
+        let prompt_line = match State.phase s { Phase.prompt(l, _) => l, _ => num.max 0 (line - 1) };
+        let out_line = if col == 0 { line } else { line + 1 };
+        let started = s |> State.set_phase (Phase.running command prompt_line out_line (now_ms! ()) (State.cwd s)) |> State.set_command_text ""
+            |> State.set_marks ((State.marks s).[prompt_line => "running"])
+            |> State.set_fresh_marks (list.cons [prompt_line, "running"] (State.fresh_marks s));
+        emit! started "started" %{ "id" => State.id s, "command" => command, "line" => prompt_line }
+        started
+    },
+    [:mark, "D", code, line, col] => match State.phase s {
+        Phase.running(command, prompt_line, out_line, started, cwd) => {
+            let exit = match num.parse_int code { () => 0, n => n };
+            let elapsed = now_ms! () - started;
+            let kind = if exit == 0 { "ok" } else { "error" };
+            let entry = Entry.new () |> Entry.set_command command |> Entry.set_cwd cwd |> Entry.set_exit exit
+                |> Entry.set_start started |> Entry.set_duration elapsed;
+            let output = str.lines (term.text_between (State.t s) out_line line);
+            if State.assist s != () && str.trim command != "" {
+                send! (State.assist s) [:finished, State.id s, entry, list.drop (num.max 0 (len output - 400)) output,
+                    out_line + num.max 0 (len output - 400), State.recent s]
+            }
+            emit! s "block" %{ "id" => State.id s, "command" => command, "cwd" => cwd, "exit" => exit, "duration" => elapsed,
+                "prompt_line" => prompt_line, "start_line" => out_line, "end_line" => line }
+            s |> State.set_phase Phase.idle
+              |> State.set_marks ((State.marks s).[prompt_line => kind])
+              |> State.set_fresh_marks (list.cons [prompt_line, kind] (State.fresh_marks s))
+              |> State.set_recent (list.drop (num.max 0 (len (State.recent s) - 9)) (list.append (State.recent s) [command]))
+        },
+        _ => s,
+    },
+    [:command, text] => State.set_command_text text s,
+    [:cwd, dir] => {
+        let n = State.set_cwd dir s;
+        emit! n "status" %{ "id" => State.id n, "title" => State.title n, "cwd" => dir, "program" => "" }
+        n
+    },
+    [:title, text] => {
+        let n = State.set_title text s;
+        emit! n "status" %{ "id" => State.id n, "title" => text, "cwd" => State.cwd n, "program" => "" }
+        n
+    },
+    [:bell] => { emit! s "bell" %{ "id" => State.id s }; s },
+    _ => s,
+};
+
+/// The shell has gone: the last frame, how it ended, and the session with it.
+priv let finish! s = {
+    let f = flush! s;
+    let code = match try! { pty.wait! (State.pty f) } catch e { pty.Exit.exited (-1) } {
+        pty.Exit.exited(n) => n,
+        pty.Exit.signalled(n) => 128 + n,
+    };
+    emit! f "exit" %{ "id" => State.id f, "code" => code }
+    f |> State.set_done true |> State.set_exit code
+};

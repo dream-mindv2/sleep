@@ -1,0 +1,127 @@
+// What a person's history says about how they work: what they run most,
+// what fails most, where the time goes, when in the day they work -- and
+// their workflows, found rather than declared.
+//
+// **Workflows are clusters.** Each command is a TF-IDF vector of its words
+// and its program (`std.ml.text`), and spherical k-means
+// (`std.ml.cluster`) groups them by what they are about: the git commands
+// of a review, the build-and-run loop of a project, the docker commands of
+// a deploy. A cluster is named by the words that weigh most in its centre.
+//
+// **How long a command takes** is an exponentially weighted average per
+// kind of command (`history.kind`: `cargo build`, not `cargo build
+// --release -p x`), which is what the window shows as "usually about 40 s"
+// while one runs, with a bar filling towards it.
+import std.list;
+import std.map;
+import std.ml.cluster;
+import std.ml.text;
+import std.num;
+import std.str;
+import history.{Entry};
+import history;
+
+/// Per kind of command: how many times it ran, failed and how long it took.
+mapping Stat {
+    runs : :integer = 0
+    failures : :integer = 0
+    total_ms : :integer = 0
+    average_ms : :float = 0.0
+    timed : :integer = 0
+}
+
+/// The running averages, by kind.
+let durations : [Entry] -> %{:string => Stat};
+let durations entries = list.fold (fn m e -> add e m) map.empty entries;
+
+/// The stats with one more command counted.
+let add : Entry -> %{:string => Stat} -> %{:string => Stat};
+let add e m = {
+    let k = history.kind (Entry.command e);
+    if k == "" { m } else {
+        let s = m.[k else Stat.new ()];
+        let timed = Entry.duration e > 0;
+        let avg = if not timed { Stat.average_ms s } else if Stat.timed s == 0 { num.to_float (Entry.duration e) }
+            else { 0.7 * Stat.average_ms s + 0.3 * num.to_float (Entry.duration e) };
+        m.[k => s |> Stat.set_runs (Stat.runs s + 1) |> Stat.set_failures (Stat.failures s + (if Entry.exit e > 0 { 1 } else { 0 }))
+            |> Stat.set_total_ms (Stat.total_ms s + Entry.duration e) |> Stat.set_average_ms avg
+            |> Stat.set_timed (Stat.timed s + (if timed { 1 } else { 0 }))]
+    }
+};
+
+/// How long `command` usually takes, in milliseconds, or `0` when unknown.
+let expected : %{:string => Stat} -> :string -> :integer;
+let expected m command = match m.[history.kind command else ()] {
+    () => 0,
+    s => if Stat.timed s < 2 { 0 } else { num.round (Stat.average_ms s) },
+};
+
+/// Workflows: up to `k` clusters of distinct commands, each named by its
+/// heaviest words, with its commands most used first.
+let workflows : [Entry] -> :integer -> [%{:string => :any}];
+let workflows entries k = {
+    let counts = list.fold (fn m e -> map.update_strict 0 (fn n -> n + 1) (str.trim (Entry.command e)) m) map.empty entries;
+    let distinct = list.take 400 (list.sort_by (fn a b -> list.nth 1 a > list.nth 1 b)
+        (list.filter (fn p -> list.head p != "") (map.pairs counts)));
+    if len distinct < k * 2 { [] } else {
+        let feats = fn c -> list.cons ("prog:" + history.head c) (list.filter (fn w -> str.length w > 1 && num.parse_int w == ()) (text.tokens c));
+        let model = text.fit_tfidf (list.map (fn p -> feats (list.head p)) distinct);
+        let vectors = list.map (fn p -> text.vector model (feats (list.head p))) distinct;
+        let c = cluster.kmeans_sparse k 17 vectors;
+        let groups = cluster.members c distinct;
+        let centres = cluster.Clusters.centres c;
+        list.filter (fn w -> w.["commands"] != []) (list.zip_with (fn centre group -> {
+            let words = list.take 3 (list.map list.head (list.sort_by (fn a b -> list.nth 1 a > list.nth 1 b)
+                (list.filter (fn p -> not (str.starts_with "prog:" (list.head p))) (map.pairs centre))));
+            let progs = list.take 1 (list.map (fn p -> str.trim_prefix "prog:" (list.head p)) (list.sort_by (fn a b -> list.nth 1 a > list.nth 1 b)
+                (list.filter (fn p -> str.starts_with "prog:" (list.head p)) (map.pairs centre))));
+            %{ "name" => str.join_str " · " (list.unique (list.append progs words)),
+               "runs" => list.fold (fn a p -> a + list.nth 1 p) 0 group,
+               "commands" => list.map list.head (list.take 6 group) }
+        }) centres groups)
+    }
+};
+
+/// The summary the Insights panel shows.
+let summary : [Entry] -> %{:string => Stat} -> %{:string => :any};
+let summary entries stats = {
+    let by_runs = list.sort_by (fn a b -> Stat.runs (list.nth 1 a) > Stat.runs (list.nth 1 b)) (map.pairs stats);
+    let failing = list.filter (fn p -> Stat.runs (list.nth 1 p) >= 3 && Stat.failures (list.nth 1 p) > 0)
+        (list.sort_by (fn a b -> fail_rate (list.nth 1 a) > fail_rate (list.nth 1 b)) (map.pairs stats));
+    let slow = list.sort_by (fn a b -> Stat.total_ms (list.nth 1 a) > Stat.total_ms (list.nth 1 b))
+        (list.filter (fn p -> Stat.total_ms (list.nth 1 p) > 0) (map.pairs stats));
+    let hours = list.map (fn h -> len (list.filter (fn e -> Entry.start e > 0 && (Entry.start e / 3600000) % 24 == h) entries)) (list.range 0 24);
+    %{
+        "commands" => len entries,
+        "distinct" => map.size stats,
+        "top" => list.map (fn p -> [list.head p, Stat.runs (list.nth 1 p)]) (list.take 8 by_runs),
+        "failing" => list.map (fn p -> [list.head p, num.round (fail_rate (list.nth 1 p) * 100.0), Stat.runs (list.nth 1 p)]) (list.take 5 failing),
+        "slowest" => list.map (fn p -> [list.head p, Stat.total_ms (list.nth 1 p), num.round (Stat.average_ms (list.nth 1 p))]) (list.take 5 slow),
+        "hours" => hours,
+    }
+};
+
+priv let fail_rate s = num.to_float (Stat.failures s) / num.to_float (num.max 1 (Stat.runs s));
+
+when test {
+    import std.test;
+    let e = fn c exit ms -> Entry.new () |> Entry.set_command c |> Entry.set_exit exit |> Entry.set_duration ms;
+    let tests = [
+        test.case "a command's usual time is learned" $({
+            let m = durations [e "cargo build" 0 10000, e "cargo build --release" 0 20000, e "cargo build" 0 12000];
+            test.true! (expected m "cargo build -p x" > 10000)
+            test.eq! 0 (expected m "ls")
+        }),
+        test.case "workflows group commands by what they share" $({
+            let cmds = ["git status", "git add .", "git commit -m wip", "git push", "git log", "git diff",
+                        "docker ps", "docker compose up", "docker logs api", "docker build -t api .", "docker images", "docker stop api"];
+            let w = workflows (list.map (fn c -> e c 0 0) cmds) 2;
+            let firsts = list.sort (list.map (fn g -> history.head (list.head g.["commands"])) w);
+            test.eq! ["docker", "git"] firsts
+        }),
+        test.case "the summary counts and ranks" $({
+            let s = summary [e "make" 2 100, e "make" 0 100, e "make" 1 100, e "ls" 0 1] (durations [e "make" 2 100, e "make" 0 100, e "make" 1 100, e "ls" 0 1]);
+            test.eq! [4, ["make", 3], ["make", 67, 3]] [s.["commands"], list.head s.["top"], list.head s.["failing"]]
+        }),
+    ];
+}

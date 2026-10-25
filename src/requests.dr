@@ -1,0 +1,133 @@
+// The request tab's backend: an HTTP request sent the way a person debugging
+// one wants it sent.
+//
+// **Redirects are followed one hop at a time**, by this module rather than
+// by the client, so each hop is kept -- its URL, status, headers and time --
+// and the window can show the whole chain: why `http://` ended at
+// `https://www.`, which hop set the cookie, which one was slow. A 303, and a
+// 301 or 302 of a POST, become a GET, as browsers do; a 307 or 308 keeps the
+// method and the body. Credentials (`Authorization`, `Cookie`) are dropped
+// at a hop to another origin, as `std.http` itself does.
+//
+// **Everything about the answer is kept**: the status and reason, every
+// header in order, the body (up to 4 MiB shown, its full size reported), how
+// long the whole exchange took, and, for a JSON body, the same body laid out
+// to read. A failure -- a refused connection, a timeout, a certificate --
+// is a result too, with its kind, since that is what is being debugged.
+import std.atom;
+import std.error;
+import std.json;
+import std.list;
+import std.str;
+import std.time;
+import std.http;
+import std.http.url;
+
+/// What the tab sends.
+mapping Ask {
+    method : :string = "GET"
+    url : :string = ""
+    headers : [[:string]] = []
+    body : :string = ""
+    timeout_ms : :integer = 30000
+    follow : :bool = true
+    max_redirects : :integer = 10
+    insecure : :bool = false
+}
+
+/// A request from the tab's JSON.
+let ask_of : json.Value -> Ask;
+let ask_of v = {
+    let s = fn k d -> match v.[k else ()] { x => if type_of x == :string { x } else { d } };
+    let i = fn k d -> match v.[k else ()] { x => if type_of x == :integer { x } else { d } };
+    let b = fn k d -> match v.[k else ()] { x => if type_of x == :bool { x } else { d } };
+    let headers = match v.["headers" else ()] {
+        hs => if type_of hs != :list { [] } else {
+            list.flat_map (fn h -> if type_of h == :list && len h == 2 && type_of (list.head h) == :string && type_of (list.nth 1 h) == :string
+                && str.trim (list.head h) != "" { [[str.trim (list.head h), list.nth 1 h]] } else { [] }) hs
+        },
+    };
+    Ask.new () |> Ask.set_method (str.upper (s "method" "GET")) |> Ask.set_url (str.trim (s "url" ""))
+        |> Ask.set_headers headers |> Ask.set_body (s "body" "") |> Ask.set_timeout_ms (i "timeout_ms" 30000)
+        |> Ask.set_follow (b "follow" true) |> Ask.set_max_redirects (i "max_redirects" 10) |> Ask.set_insecure (b "insecure" false)
+};
+
+/// A URL a person typed, with `http://` added when it has no scheme -- and
+/// `https://` for anything that is not this machine.
+let normal_url : :string -> :string;
+let normal_url u = if str.contains_str "://" u { u }
+    else if str.starts_with "localhost" u || str.starts_with "127." u || str.starts_with "[::1]" u || str.starts_with "0.0.0.0" u { "http://" + u }
+    else { "https://" + u };
+
+priv let max_body = 4194304;
+
+priv let origin u = match url.parse u { Result.ok(p) => url.authority p + "|" + str.lower (list.head (str.split ":" u)), Result.error(_) => u };
+
+/// One exchange, timed: `[response or error, ms]`.
+priv let exchange! a method target headers body = {
+    let started = time.monotonic! ();
+    let req = http.request method target |> http.with_headers headers |> http.with_body body
+        |> http.with_timeout (time.milliseconds (Ask.timeout_ms a)) |> http.with_redirects 0
+        |> (if Ask.insecure a { http.with_tls %{ :verify => false } } else { fn r -> r });
+    let result = try! { http.send! req } catch e { Result.error e };
+    strict! result
+    [result, (time.monotonic! () - started) / 1000000]
+};
+
+/// Send `a`, following redirects as it says; the result as the tab shows it.
+let send! : Ask -> json.Value;
+let send! a = {
+    let start_url = normal_url (Ask.url a);
+    let started = time.monotonic! ();
+    let rec go! method target body headers hops n = {
+        let [result, ms] = exchange! a method target headers body;
+        match result {
+            Result.error(e) => [Result.error e, list.reverse hops],
+            Result.ok(resp) => {
+                let status = http.status resp;
+                let hop = %{ "url" => target, "method" => method, "status" => status, "ms" => ms, "headers" => http.Response.headers resp };
+                let location = http.header "location" resp;
+                if Ask.follow a && status >= 300 && status < 400 && location != () && n < Ask.max_redirects a {
+                    let next = match url.parse target { Result.ok(base) => url.to_text (url.resolve base location), Result.error(_) => location };
+                    let as_get = status == 303 || ((status == 301 || status == 302) && method == "POST");
+                    let same = origin next == origin target;
+                    let kept = list.filter (fn h -> same || not (list.contains (str.lower (list.head h)) ["authorization", "cookie", "proxy-authorization"])) headers;
+                    go! (if as_get { "GET" } else { method }) next (if as_get { "" } else { body })
+                       (if as_get { list.filter (fn h -> str.lower (list.head h) != "content-type") kept } else { kept })
+                       (list.cons hop hops) (n + 1)
+                } else { [Result.ok [resp, target], list.reverse (list.cons hop hops)] }
+            },
+        }
+    };
+    let [outcome, hops] = go! (Ask.method a) start_url (Ask.body a) (Ask.headers a) [] 0;
+    let total = (time.monotonic! () - started) / 1000000;
+    match outcome {
+        Result.error(e) => %{ "ok" => false, "error" => error.message e, "kind" => atom.name (error.kind e), "ms" => total,
+            "hops" => hops, "url" => start_url },
+        Result.ok([resp, final]) => {
+            let body = http.body resp;
+            let size = str.byte_length body;
+            let shown = if size > max_body { str.slice 0 max_body body } else { body };
+            let pretty = match http.content_type resp {
+                () => "",
+                ct => if str.contains_str "json" (str.lower ct) { match json.decode body { Result.ok(v) => json.pretty v, Result.error(_) => "" } } else { "" },
+            };
+            %{ "ok" => true, "status" => http.status resp, "reason" => http.reason (http.status resp),
+               "headers" => http.Response.headers resp, "body" => shown, "pretty" => pretty, "size" => size,
+               "truncated" => size > max_body, "ms" => total, "hops" => hops, "url" => final,
+               "content_type" => match http.content_type resp { () => "", ct => ct } }
+        },
+    }
+};
+
+when test {
+    import std.test;
+    let tests = [
+        test.case "a URL without a scheme gets one" $(test.eq! ["https://example.com/x", "http://localhost:3000", "http://a.b"]
+            [normal_url "example.com/x", normal_url "localhost:3000", normal_url "http://a.b"]),
+        test.case "the tab's JSON is read field by field" $({
+            let a = ask_of %{ "method" => "post", "url" => " x.io ", "headers" => [["Accept", "*/*"], ["", "no"], 5], "follow" => false };
+            test.eq! ["POST", "x.io", [["Accept", "*/*"]], false, 30000] [Ask.method a, Ask.url a, Ask.headers a, Ask.follow a, Ask.timeout_ms a]
+        }),
+    ];
+}

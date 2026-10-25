@@ -1,0 +1,232 @@
+// The settings tab: everything a person can change, saved as it is changed.
+//
+// It edits a `Settings` the window owns -- the window applies each change at
+// once (a scheme recolours the open terminals, a font size resizes them) and
+// sends it to the backend to keep. A shortcut is changed by recording it:
+// press "Change", then the chord.
+import std.graphics as ui;
+import std.graphics.html;
+import std.graphics.widgets as w;
+import std.list;
+import std.map;
+import std.num;
+import std.str;
+import keys;
+import schemes.{Scheme};
+import schemes;
+import settings.{Settings};
+import settings;
+import ui_common;
+
+mapping Model {
+    section : :string = "appearance"
+    recording : :string = ""
+}
+
+union Msg {
+    section(s : :string)
+    scheme(id : :string)
+    theme(t : :string)
+    accent(c : :string)
+    font_size(n : :any)
+    font(f : :string)
+    line_height(s : :string)
+    cursor(c : :string)
+    shell(s : :string)
+    scrollback(n : :any)
+    toggle(field : :string, on : :bool)
+    animation(which : :string, name : :string)
+    custom_css(s : :string)
+    record(action : :string)
+    recorded(k : :any)
+    reset_key(action : :string)
+    reset_all
+}
+
+priv let atom_named s = match s { "light" => :light, "dark" => :dark, "bar" => :bar, "underline" => :underline, "block" => :block, _ => :auto };
+
+let update : Msg -> Model -> Settings -> [Model, Settings];
+let update msg m s = match msg {
+    Msg.section(x) => [Model.set_section x m, s],
+    Msg.scheme(id) => [m, Settings.set_scheme id s],
+    Msg.theme(t) => [m, Settings.set_theme (atom_named t) s],
+    Msg.accent(c) => [m, Settings.set_accent c s],
+    Msg.font_size(n) => [m, if type_of n == :integer && n >= 8 && n <= 40 { Settings.set_font_size n s } else { s }],
+    Msg.font(f) => [m, Settings.set_font f s],
+    Msg.line_height(x) => [m, match x { "1.1" => Settings.set_line_height 1.1 s, "1.2" => Settings.set_line_height 1.2 s,
+        "1.4" => Settings.set_line_height 1.4 s, "1.5" => Settings.set_line_height 1.5 s, _ => Settings.set_line_height 1.3 s }],
+    Msg.cursor(c) => [m, Settings.set_cursor (atom_named c) s],
+    Msg.shell(x) => [m, Settings.set_shell x s],
+    Msg.scrollback(n) => [m, if type_of n == :integer && n >= 100 && n <= 100000 { Settings.set_scrollback n s } else { s }],
+    Msg.toggle(field, on) => [m, match field {
+        "copy_on_select" => Settings.set_copy_on_select on s, "bell" => Settings.set_bell on s,
+        "confirm_close" => Settings.set_confirm_close on s, "integration" => Settings.set_integration on s,
+        "autosuggest" => Settings.set_autosuggest on s, "predictions" => Settings.set_predictions on s,
+        "risk_guard" => Settings.set_risk_guard on s, "explain" => Settings.set_explain on s, "train" => Settings.set_train on s,
+        "animations" => Settings.set_animations on s, "assistant_open" => Settings.set_assistant_open on s,
+        _ => s,
+    }],
+    Msg.animation(which, name) => [m, match which {
+        "running" => Settings.set_anim_running name s, "success" => Settings.set_anim_success name s,
+        "failure" => Settings.set_anim_failure name s, "long" => Settings.set_anim_long name s, _ => Settings.set_anim_bell name s,
+    }],
+    Msg.custom_css(x) => [m, Settings.set_custom_css x s],
+    Msg.record(a) => [Model.set_recording a m, s],
+    Msg.recorded(k) => if Model.recording m == "" { [m, s] } else {
+        let key = k.["key" else ""];
+        if list.contains key ["Shift", "Control", "Alt", "Meta"] { [m, s] }
+        else if key == "Escape" { [Model.set_recording "" m, s] }
+        else { [Model.set_recording "" m, Settings.set_keys ((Settings.keys s).[Model.recording m => keys.chord k]) s] }
+    },
+    Msg.reset_key(a) => [m, Settings.set_keys (map.remove a (Settings.keys s)) s],
+    Msg.reset_all => [m, Settings.set_keys %{} s],
+};
+
+// --- the view ------------------------------------------------------------------------
+
+priv let scheme_card wrap current sc = {
+    let swatch = fn c -> ui.element "span" [html.class "sl-swatch", html.style "background" c] [];
+    ui.element "button" [html.class ("sl-scheme" + (if Scheme.id sc == current { " sl-scheme-on" } else { "" })),
+        html.attr "type" "button", html.aria "pressed" (if Scheme.id sc == current { "true" } else { "false" }),
+        html.on_click (wrap (Msg.scheme (Scheme.id sc))), html.key ("scheme-" + Scheme.id sc)] [
+        ui.element "span" [html.class "sl-scheme-preview", html.style "background" (Scheme.background sc), html.style "color" (Scheme.foreground sc)] [
+            ui.element "span" [html.class "sl-scheme-line"] [
+                ui.element "span" [html.style "color" (list.nth 2 (Scheme.ansi sc))] [ui.text "~/app"],
+                ui.element "span" [html.style "color" (list.nth 4 (Scheme.ansi sc))] [ui.text " main"],
+                ui.text " $ make"],
+            ui.element "span" [html.class "sl-scheme-line"] [ui.element "span" [html.style "color" (list.nth 1 (Scheme.ansi sc))] [ui.text "error"],
+                ui.text ": ", ui.element "span" [html.style "color" (list.nth 3 (Scheme.ansi sc))] [ui.text "warning"]],
+            ui.element "span" [html.class "sl-scheme-swatches"] (list.map swatch (list.take 8 (list.drop 1 (Scheme.ansi sc)))),
+        ],
+        ui.element "span" [html.class "sl-scheme-name"] [ui.text (Scheme.name sc)],
+    ]
+};
+
+priv let theme_name t = match t { :light => "light", :dark => "dark", _ => "auto" };
+
+priv let appearance wrap s = w.column [
+    w.section "Colour scheme" [ui.element "div" [html.class "sl-schemes"] (list.map (fn sc -> scheme_card wrap (Settings.scheme s) sc) schemes.all)],
+    w.card [
+        w.radio_group "Window" ["auto", "dark", "light"] (theme_name (Settings.theme s)) (fn t -> wrap (Msg.theme t))
+            |> w.hint "Auto follows the colour scheme.",
+        w.text_field "Accent colour" (Settings.accent s) (fn c -> wrap (Msg.accent c)) |> w.placeholder "the scheme's" |> w.hint "Any CSS colour, or empty for the scheme's own." |> w.mono,
+        w.grid 2 [
+            w.number_field "Font size" (Settings.font_size s) (fn n -> wrap (Msg.font_size n)),
+            w.select "Line height" ["1.1", "1.2", "1.3", "1.4", "1.5"] (to_string (Settings.line_height s)) (fn x -> wrap (Msg.line_height x)),
+        ],
+        w.text_field "Font" (Settings.font s) (fn f -> wrap (Msg.font f)) |> w.placeholder "JetBrains Mono, Fira Code, …" |> w.hint "A list of fonts, as CSS writes it; empty for the default.",
+        w.radio_group "Cursor" ["block", "bar", "underline"] (match Settings.cursor s { :bar => "bar", :underline => "underline", _ => "block" }) (fn c -> wrap (Msg.cursor c)),
+    ],
+];
+
+priv let toggle wrap s field label value = w.switch label value (fn b -> wrap (Msg.toggle field b));
+
+priv let terminal_section wrap s = w.card [
+    w.text_field "Shell" (Settings.shell s) (fn x -> wrap (Msg.shell x)) |> w.placeholder "$SHELL" |> w.hint "The program a new terminal runs; empty for your login shell." |> w.mono,
+    w.number_field "Scrollback lines" (Settings.scrollback s) (fn n -> wrap (Msg.scrollback n)),
+    toggle wrap s "integration" "Shell integration (command blocks, queue, assistant)" (Settings.integration s),
+    toggle wrap s "copy_on_select" "Copy text when it is selected" (Settings.copy_on_select s),
+    toggle wrap s "bell" "Sound the bell" (Settings.bell s),
+    toggle wrap s "confirm_close" "Ask before closing a tab that is running something" (Settings.confirm_close s),
+];
+
+priv let assistant_section wrap s status = w.column [
+    w.card [
+        toggle wrap s "assistant_open" "Show the assistant beside terminals" (Settings.assistant_open s),
+        toggle wrap s "autosuggest" "Suggest how a command ends, as you type (→ accepts)" (Settings.autosuggest s),
+        toggle wrap s "predictions" "Predict the next command" (Settings.predictions s),
+        toggle wrap s "explain" "Explain failures and offer fixes" (Settings.explain s),
+        toggle wrap s "risk_guard" "Ask before running commands that cannot be undone" (Settings.risk_guard s),
+        toggle wrap s "train" "Train a neural network on my history, on this machine" (Settings.train s),
+    ],
+    w.card [
+        w.heading "What it has learned",
+        if status == () { w.caption "Not started yet." } else {
+            w.pairs [
+                ["History", to_string (status.["commands" else 0]) + " commands"],
+                ["Network", if status.["training" else false] { "training…" } else if status.["trained" else false] {
+                    to_string (status.["classes" else 0]) + " commands, " + ui_common.percent (status.["accuracy" else 0.0]) + " right on held-out examples"
+                } else { "not trained yet (needs a few hundred commands)" }],
+                ["Examples", to_string (status.["examples" else 0])],
+            ]
+        },
+        w.caption "Everything is learned from your own history, on this machine, and kept in ~/.local/share/sleep.",
+    ],
+];
+
+priv let anim_choice wrap which label options current = w.select_of label options current (fn x -> wrap (Msg.animation which x));
+
+priv let animations_section wrap s = w.column [
+    w.card [
+        toggle wrap s "animations" "Animations" (Settings.animations s),
+        w.grid 2 [
+            anim_choice wrap "running" "While a command runs" settings.running_animations (Settings.anim_running s),
+            anim_choice wrap "success" "When it succeeds" settings.success_animations (Settings.anim_success s),
+            anim_choice wrap "failure" "When it fails" settings.failure_animations (Settings.anim_failure s),
+            anim_choice wrap "long" "When a long one finishes" settings.long_animations (Settings.anim_long s),
+            anim_choice wrap "bell" "On the bell" settings.bell_animations (Settings.anim_bell s),
+        ],
+    ],
+    w.card [
+        w.heading "Custom CSS",
+        w.text_area "CSS" (Settings.custom_css s) (fn x -> wrap (Msg.custom_css x)) |> w.quiet_label |> w.mono
+            |> w.placeholder ".sl-cat-body { background: hotpink; }\n.sl-comet::before { animation-duration: 1s; }"
+            |> w.hint "Applied over sleep's own styles: restyle an animation by its classes (.sl-cat, .sl-orbit, .sl-comet, .sl-sparkle, .sl-shake, .sl-confetti, …), or anything else.",
+    ],
+];
+
+priv let keys_section wrap m s = w.card [
+    w.row [w.heading "Keyboard shortcuts", w.spacer, w.button "Reset all" (wrap Msg.reset_all) |> w.ghost |> w.small],
+    if Model.recording m == "" { ui.nothing } else { w.notice :info "Press the new shortcut, or Escape to keep the old one." },
+    w.column (list.map (fn a -> {
+        let action = list.head a;
+        let recording = Model.recording m == action;
+        w.row [
+            w.text (list.nth 2 a) |> w.grow,
+            if recording { w.badge "press keys…" |> w.tone :accent } else { w.kbd (settings.chord_for s action) },
+            w.button (if recording { "Recording" } else { "Change" }) (wrap (Msg.record action)) |> w.small |> w.ghost,
+            if map.has action (Settings.keys s) { w.icon_button "refresh" "Default" (wrap (Msg.reset_key action)) |> w.small |> w.ghost } else { ui.nothing },
+        ] |> ui.keyed ("k" + action)
+    }) settings.actions) |> w.gap 1,
+];
+
+let view : (Msg -> :any) -> Model -> Settings -> :any -> ui.Node;
+let view wrap m s status = w.workspace [
+    w.sidebar [
+        w.nav_item "sun" "Appearance" (Model.section m == "appearance") (wrap (Msg.section "appearance")),
+        w.nav_item "terminal" "Terminal" (Model.section m == "terminal") (wrap (Msg.section "terminal")),
+        w.nav_item "sparkles" "Assistant" (Model.section m == "assistant") (wrap (Msg.section "assistant")),
+        w.nav_item "zap" "Animations" (Model.section m == "animations") (wrap (Msg.section "animations")),
+        w.nav_item "command" "Keyboard" (Model.section m == "keys") (wrap (Msg.section "keys")),
+        w.spacer,
+        w.caption "sleep 0.1.0 · written in Dream",
+    ] |> w.width "14rem",
+    w.panel [
+        w.title (match Model.section m { "terminal" => "Terminal", "assistant" => "Assistant", "animations" => "Animations",
+            "keys" => "Keyboard", _ => "Appearance" }),
+        match Model.section m {
+            "terminal" => terminal_section wrap s,
+            "assistant" => assistant_section wrap s status,
+            "animations" => animations_section wrap s,
+            "keys" => keys_section wrap m s,
+            _ => appearance wrap s,
+        },
+    ] |> w.padding 6 |> w.gap 4 |> w.max_width "60rem",
+];
+
+when test {
+    import std.test;
+    let tests = [
+        test.case "a recorded chord becomes the action's" $({
+            let [m, s] = update (Msg.record "palette") (Model.new ()) (Settings.new ());
+            let [m2, s2] = update (Msg.recorded %{"key" => "k", "ctrl" => true}) m s;
+            test.eq! ["", "Ctrl+K"] [Model.recording m2, settings.chord_for s2 "palette"]
+        }),
+        test.case "a modifier alone is not a chord, and Escape keeps the old one" $({
+            let [m, s] = update (Msg.record "palette") (Model.new ()) (Settings.new ());
+            let [m2, s2] = update (Msg.recorded %{"key" => "Control", "ctrl" => true}) m s;
+            let [m3, s3] = update (Msg.recorded %{"key" => "Escape"}) m2 s2;
+            test.eq! ["palette", "", "Ctrl+Shift+P"] [Model.recording m2, Model.recording m3, settings.chord_for s3 "palette"]
+        }),
+    ];
+}

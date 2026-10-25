@@ -1,0 +1,42 @@
+// Small things every tab shows the same way: durations, sizes, and the
+// wrapping of a tab's messages.
+import std.crypto;
+import std.list;
+import std.num;
+import std.str;
+
+/// A duration a person reads: `820 ms`, `4.2 s`, `3 m 05 s`, `2 h 14 m`.
+let duration : :integer -> :string;
+let duration ms = if ms < 1000 { to_string ms + " ms" }
+    else if ms < 60000 { tenths ms 1000 + " s" }
+    else if ms < 3600000 { to_string (ms / 60000) + " m " + str.pad_start 2 "0" (to_string ((ms / 1000) % 60)) + " s" }
+    else { to_string (ms / 3600000) + " h " + to_string ((ms / 60000) % 60) + " m" };
+
+/// A size a person reads: `512 B`, `1.4 KB`, `23.0 MB`.
+let bytes : :integer -> :string;
+let bytes n = if n < 1024 { to_string n + " B" } else if n < 1048576 { tenths n 1024 + " KB" }
+    else if n < 1073741824 { tenths n 1048576 + " MB" } else { tenths n 1073741824 + " GB" };
+
+/// `n / unit` with one decimal.
+priv let tenths n unit = { let t = (n * 10 + unit / 2) / unit; to_string (t / 10) + "." + to_string (t % 10) };
+
+/// Text as base64, for a Basic credential.
+let base64 : :string -> :string;
+let base64 s = crypto.base64 s;
+
+/// A percentage, rounded: `0.356` is `36%`.
+let percent : :float -> :string;
+let percent f = to_string (num.round (f * 100.0)) + "%";
+
+/// Text cut to `n` characters, with an ellipsis when it was longer.
+let clip : :integer -> :string -> :string;
+let clip n s = if str.length s <= n { s } else { str.of_chars (list.take (n - 1) (str.chars s)) + "\u{2026}" };
+
+when test {
+    import std.test;
+    let tests = [
+        test.case "durations" $(test.eq! ["820 ms", "4.2 s", "3 m 05 s", "2 h 14 m"] [duration 820, duration 4210, duration 185000, duration 8040000]),
+        test.case "sizes" $(test.eq! ["512 B", "1.5 KB", "23.0 MB"] [bytes 512, bytes 1536, bytes 24117248]),
+        test.case "clipping" $(test.eq! ["abc", "ab\u{2026}"] [clip 3 "abc", clip 3 "abcd"]),
+    ];
+}

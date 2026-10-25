@@ -1,0 +1,207 @@
+// Asking for a command in words: "find files bigger than 100 MB",
+// "what is listening on port 8080", "undo the last commit".
+//
+// A cookbook of tasks, each a few ways of saying it and a command with holes
+// in it, searched by meaning: the question and every task are TF-IDF
+// vectors of their words and their character trigrams (`std.ml.text`), so
+// "biggest files" finds "find large files" and "lisening" still finds
+// "listening". The holes are filled from the question -- a number, a size, a
+// port, a quoted name, a file extension, a branch -- and a hole the question
+// does not fill keeps a placeholder for the person to type over.
+//
+// It runs nothing. It answers commands for a person to read, change and run.
+import std.char;
+import std.list;
+import std.map;
+import std.ml.text;
+import std.num;
+import std.regex;
+import std.str;
+
+/// A task: how it is asked, and the command, with `{n}`, `{size}`, `{port}`,
+/// `{name}`, `{ext}`, `{path}`, `{branch}`, `{host}`, `{pid}` or `{user}` for
+/// what the question says.
+mapping Recipe {
+    ask : :string = ""
+    command : :string = ""
+    note : :string = ""
+}
+
+priv let r ask command note = Recipe.new () |> Recipe.set_ask ask |> Recipe.set_command command |> Recipe.set_note note;
+
+let recipes : [Recipe];
+let recipes = [
+    r "find large big biggest files bigger than size" "find . -type f -size +{size} -exec ls -lh {} + | sort -k5 -rh | head -20" "Files over the size, largest first",
+    r "find files by name named called" "find . -name '{name}'" "Files with that name, below here",
+    r "find files with extension type ending" "find . -type f -name '*.{ext}'" "Files of that type, below here",
+    r "find files modified changed recently in the last days" "find . -type f -mtime -{n}" "Files changed in the last n days",
+    r "search grep text inside files containing string" "grep -rn '{name}' ." "Lines containing the text, with file and line",
+    r "count lines of code in files" "find . -name '*.{ext}' | xargs wc -l | tail -1" "Total lines in files of that type",
+    r "disk usage of folder directory size how big" "du -sh {path}" "How much space a directory takes",
+    r "what is using disk space largest directories" "du -h --max-depth=1 . | sort -rh | head -20" "The largest directories here",
+    r "free disk space left on drives" "df -h" "Free space on each mounted drive",
+    r "memory usage ram free" "free -h" "Memory in use and free",
+    r "what process is listening on port who uses port" "lsof -i :{port}" "The process that has the port open",
+    r "kill process on port free port" "kill $(lsof -t -i :{port})" "Stop whatever is listening on the port",
+    r "list open ports listening sockets" "ss -tulpn" "Every listening TCP and UDP socket, with its process",
+    r "kill process by name stop program" "pkill -f '{name}'" "Stop processes whose command line matches",
+    r "kill process by id pid" "kill {pid}" "Ask a process to stop",
+    r "force kill process" "kill -9 {pid}" "Stop a process at once, without letting it clean up",
+    r "list processes running top cpu usage" "ps aux --sort=-%cpu | head -15" "The processes using the most CPU",
+    r "processes using most memory" "ps aux --sort=-%mem | head -15" "The processes using the most memory",
+    r "find process by name" "pgrep -af '{name}'" "Processes whose command line matches",
+    r "watch a log file follow tail" "tail -f {path}" "Show lines as they are added",
+    r "show last lines of file" "tail -n {n} {path}" "The last lines of a file",
+    r "count lines in file" "wc -l {path}" "How many lines a file has",
+    r "make script executable permission" "chmod +x {path}" "Allow running a file as a program",
+    r "change owner of files" "sudo chown -R $USER {path}" "Make files yours",
+    r "create directory folder with parents" "mkdir -p {path}" "Make a directory and any missing parents",
+    r "copy directory recursively" "cp -r {path} {path}.copy" "Copy a directory and everything in it",
+    r "rename move file" "mv {path} {name}" "Rename or move a file",
+    r "compress folder tar gz archive" "tar -czf {name}.tar.gz {path}" "Pack a directory into a .tar.gz",
+    r "extract unpack tar gz archive" "tar -xzf {path}" "Unpack a .tar.gz here",
+    r "zip folder" "zip -r {name}.zip {path}" "Pack a directory into a .zip",
+    r "unzip file" "unzip {path}" "Unpack a .zip here",
+    r "download file from url" "curl -LO {host}" "Save what a URL points to",
+    r "http request get url headers" "curl -i {host}" "Fetch a URL, showing the response's headers",
+    r "post json to api" "curl -X POST -H 'Content-Type: application/json' -d '{}' {host}" "Send JSON to a URL",
+    r "check if host is up ping" "ping -c 4 {host}" "Is a host reachable",
+    r "dns lookup ip address of domain" "dig +short {host}" "The address a name resolves to",
+    r "my public ip address" "curl -s https://ifconfig.me" "Your address as the internet sees it",
+    r "local ip address network interfaces" "ip -brief addr" "This machine's addresses",
+    r "ssh into server connect remote" "ssh {user}@{host}" "Open a shell on another machine",
+    r "copy file to server scp" "scp {path} {user}@{host}:~/" "Copy a file to another machine",
+    r "sync folders rsync" "rsync -avh --progress {path} {user}@{host}:{path}" "Copy only what changed",
+    r "generate ssh key" "ssh-keygen -t ed25519 -C \"$USER@$(hostname)\"" "A new SSH key pair",
+    r "git undo last commit keep changes" "git reset --soft HEAD~1" "Take back the last commit; its changes stay staged",
+    r "git discard local changes" "git restore ." "Throw away changes not yet staged",
+    r "git unstage files" "git restore --staged ." "Take files back out of the next commit",
+    r "git create new branch switch" "git switch -c {branch}" "A new branch, from here",
+    r "git delete branch" "git branch -d {branch}" "Delete a branch that has been merged",
+    r "git list branches recent" "git branch --sort=-committerdate | head" "Branches, most recently used first",
+    r "git show history log graph" "git log --oneline --graph --decorate -20" "Recent commits as a graph",
+    r "git who changed line blame" "git blame {path}" "Who last changed each line",
+    r "git stash save changes for later" "git stash push -m '{name}'" "Put changes aside",
+    r "git apply stash restore" "git stash pop" "Bring back the last changes put aside",
+    r "git amend last commit message" "git commit --amend" "Change the last commit",
+    r "git push new branch upstream" "git push -u origin HEAD" "Push this branch and track it",
+    r "git pull rebase update" "git pull --rebase" "Bring in the remote's commits under yours",
+    r "git diff staged changes" "git diff --staged" "What the next commit will hold",
+    r "git find commit by message search" "git log --oneline --grep='{name}'" "Commits whose message mentions it",
+    r "git clean untracked files" "git clean -nd" "Which untracked files would be removed (add -f to remove)",
+    r "git tag release version" "git tag -a v{n} -m 'v{n}'" "Tag this commit as a release",
+    r "docker list running containers" "docker ps" "Containers that are running",
+    r "docker stop all containers" "docker stop $(docker ps -q)" "Stop every running container",
+    r "docker remove unused images prune clean" "docker system prune" "Remove stopped containers and unused images",
+    r "docker shell into container exec" "docker exec -it {name} sh" "A shell inside a running container",
+    r "docker logs of container follow" "docker logs -f {name}" "A container's output as it comes",
+    r "docker build image" "docker build -t {name} ." "Build an image from the Dockerfile here",
+    r "docker compose start up" "docker compose up -d" "Start the services in compose.yaml",
+    r "python virtual environment venv create" "python3 -m venv .venv && . .venv/bin/activate" "An isolated Python environment",
+    r "python install requirements" "pip install -r requirements.txt" "Install a project's dependencies",
+    r "python simple http server serve folder" "python3 -m http.server {port}" "Serve this directory over HTTP",
+    r "node install dependencies" "npm install" "Install a project's dependencies",
+    r "run npm script" "npm run {name}" "Run a script from package.json",
+    r "rust build release" "cargo build --release" "An optimized build",
+    r "run tests" "cargo test" "Run the test suite (Rust); npm test, pytest, go test ./... for others",
+    r "systemd service status restart" "systemctl status {name}" "Whether a service is running, and its last log lines",
+    r "service logs journal" "journalctl -u {name} -f" "A service's log as it comes",
+    r "list installed packages" "apt list --installed" "Installed packages (Debian, Ubuntu)",
+    r "update system packages upgrade" "sudo apt update && sudo apt upgrade" "Bring packages up to date (Debian, Ubuntu)",
+    r "show environment variables" "env | sort" "Every environment variable",
+    r "set environment variable" "export {name}=value" "Set a variable for this shell and what it starts",
+    r "add to path" "export PATH=\"$PATH:{path}\"" "Make programs in a directory runnable by name",
+    r "current date time timestamp" "date -Iseconds" "Now, in ISO 8601",
+    r "convert unix timestamp to date" "date -d @{n}" "A timestamp as a date",
+    r "calculate checksum sha256 hash of file" "sha256sum {path}" "A file's SHA-256",
+    r "base64 encode decode" "base64 {path}" "A file as base64 (base64 -d to decode)",
+    r "random password generate" "openssl rand -base64 {n}" "Random bytes as text",
+    r "pretty print json format" "python3 -m json.tool {path}" "JSON laid out to read",
+    r "jq extract field from json" "jq '.{name}' {path}" "One field of a JSON document",
+    r "replace text in files sed" "sed -i 's/old/new/g' {path}" "Replace text in a file",
+    r "sort unique count lines" "sort {path} | uniq -c | sort -rn | head" "The commonest lines, with counts",
+    r "compare two files diff" "diff -u {path} {name}" "How two files differ",
+    r "run command every few seconds watch" "watch -n {n} '{name}'" "Run a command again and again",
+    r "time how long a command takes" "time {name}" "How long a command takes",
+    r "repeat last command with sudo" "sudo !!" "The last command again, as root",
+    r "search command history" "history | grep '{name}'" "Earlier commands that mention it",
+    r "who is logged in users" "who" "Who is logged in",
+    r "system information kernel version" "uname -a" "The kernel and the machine",
+    r "cpu information cores" "lscpu" "The processor",
+    r "gpu usage nvidia" "nvidia-smi" "The GPU and what is using it",
+    r "reboot restart computer" "sudo reboot" "Restart the machine",
+];
+
+priv let features q = list.append (text.tokens q) (text.char_ngrams 3 q);
+priv let index = text.index features (list.map_indexed (fn i rc -> [i, Recipe.ask rc]) recipes);
+
+/// What a question says that a recipe can use.
+let slots : :string -> %{:string => :string};
+let slots q = {
+    let find_one = fn pattern -> match regex.parse_with [:ignore_case] pattern {
+        Result.ok(rx) => match regex.groups (regex.find rx q) { () => (), [] => (), gs => list.head gs },
+        Result.error(_) => (),
+    };
+    let size = match find_one "(\\d+)\\s*(k|kb|m|mb|meg|megabytes?|g|gb|gigabytes?)\\b" {
+        () => (),
+        n => {
+            let unit = str.lower (match find_one "\\d+\\s*(k|kb|m|mb|meg|megabytes?|g|gb|gigabytes?)\\b" { () => "m", u => u });
+            n + (if str.starts_with "k" unit { "k" } else if str.starts_with "g" unit { "G" } else { "M" })
+        },
+    };
+    let quoted = match find_one "['\"`]([^'\"`]+)['\"`]" { () => (), x => x };
+    let ext = match find_one "\\.([a-zA-Z0-9]{1,6})\\b" {
+        () => match find_one "\\b(python|rust|javascript|typescript|go|java|markdown|json|yaml|shell|c\\+\\+|html|css)\\b" {
+            () => (),
+            lang => match str.lower lang { "python" => "py", "rust" => "rs", "javascript" => "js", "typescript" => "ts", "go" => "go",
+                "java" => "java", "markdown" => "md", "json" => "json", "yaml" => "yaml", "shell" => "sh", "html" => "html",
+                "css" => "css", _ => "cpp" },
+        },
+        e => e,
+    };
+    let host = find_one "\\b((?:https?://)?[a-zA-Z0-9-]+(?:\\.[a-zA-Z0-9-]+)+(?:/\\S*)?)";
+    let path_word = find_one "((?:\\.{0,2}/|~/)[\\w./-]*)";
+    let named = match quoted { () => find_one "(?:named|called|containing|for|branch)\\s+([\\w.@-]+)", x => x };
+    let pairs = [
+        ["n", find_one "\\b(\\d+)\\b"], ["size", size], ["port", find_one "port\\s*:?\\s*(\\d+)"], ["pid", find_one "(?:pid|process)\\s+(\\d+)"],
+        ["name", named], ["ext", ext], ["host", host], ["path", path_word], ["branch", find_one "branch\\s+([\\w./-]+)"],
+        ["user", find_one "(?:user|as)\\s+([a-z_][\\w-]*)"],
+    ];
+    map.from_pairs (list.filter (fn p -> list.nth 1 p != ()) pairs)
+};
+
+/// A recipe's command with the question's values put in its holes; a hole
+/// left empty keeps a readable placeholder.
+let fill : :string -> %{:string => :string} -> :string;
+let fill command values = {
+    let defaults = %{ "n" => "7", "size" => "100M", "port" => "8080", "pid" => "PID", "name" => "NAME", "ext" => "txt",
+        "host" => "example.com", "path" => ".", "branch" => "my-branch", "user" => "$USER" };
+    list.fold (fn c key -> str.replace ("{" + key + "}") (values.[key else defaults.[key]]) c) command (map.keys defaults)
+};
+
+/// The commands that do what `question` asks, best first:
+/// `%{ "command", "note", "score" }`.
+let ask : :string -> :integer -> [%{:string => :any}];
+let ask question k = {
+    let values = slots question;
+    // A language named is a kind of file: say so in the words the recipe uses.
+    let languages = ["python", "rust", "javascript", "typescript", "java", "markdown", "json", "yaml", "html", "css"];
+    let expanded = if list.any (fn w -> list.contains w languages) (text.tokens question) { question + " extension type" } else { question };
+    list.map (fn hit -> {
+        let rc = list.nth (list.head hit) recipes;
+        %{ "command" => fill (Recipe.command rc) values, "note" => Recipe.note rc, "score" => list.nth 1 hit }
+    }) (text.search index expanded k)
+};
+
+when test {
+    import std.test;
+    let first = fn q -> (list.head (ask q 1)).["command"];
+    let tests = [
+        test.case "a size is filled in" $(test.eq! "find . -type f -size +500M -exec ls -lh {} + | sort -k5 -rh | head -20"
+            (first "find files bigger than 500 MB")),
+        test.case "a port is filled in" $(test.eq! "lsof -i :8080" (first "what is listening on port 8080")),
+        test.case "misspelled questions are still understood" $(test.eq! "git reset --soft HEAD~1" (first "undo my lsat comit")),
+        test.case "a language is an extension" $(test.eq! "find . -type f -name '*.py'" (first "find all python files")),
+        test.case "an empty hole keeps a placeholder" $(test.eq! "git switch -c my-branch" (fill "git switch -c {branch}" %{})),
+    ];
+}

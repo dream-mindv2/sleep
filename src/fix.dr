@@ -1,0 +1,143 @@
+// "Did you mean": the command a mistyped one was meant to be.
+//
+// A noisy-channel model, as spelling correction has been done since the
+// 1990s: the intended word `c` for a typed `t` is the one that makes
+// `P(c) * P(t | c)` largest. `P(c)` -- how likely a person is to want `c` at
+// all -- is learned from what they run, with a little weight for every
+// program on `PATH` they have not run yet. `P(t | c)` -- how likely `c` is to
+// come out as `t` -- falls by a factor for each edit between them, counting
+// two swapped neighbours (`gti`) as one edit rather than two, since that is
+// the commonest slip of all (Damerau, 1964).
+//
+// It corrects the program, and for the programs whose first argument is a
+// subcommand -- `git psuh`, `docker biuld` -- the subcommand too, from the
+// subcommands those programs have and the ones this person has used.
+import std.file;
+import std.list;
+import std.map;
+import std.math;
+import std.num;
+import std.os;
+import std.str;
+import history;
+
+/// The subcommands of the programs people mistype them for most.
+let subcommands : %{:string => [:string]};
+let subcommands = %{
+    "git" => ["add", "am", "bisect", "blame", "branch", "checkout", "cherry-pick", "clean", "clone", "commit", "config",
+        "diff", "fetch", "grep", "init", "log", "merge", "mv", "pull", "push", "rebase", "reflog", "remote", "reset",
+        "restore", "revert", "rm", "show", "stash", "status", "submodule", "switch", "tag", "worktree"],
+    "docker" => ["build", "compose", "exec", "images", "inspect", "kill", "login", "logs", "network", "ps", "pull",
+        "push", "restart", "rm", "rmi", "run", "start", "stop", "system", "tag", "volume"],
+    "cargo" => ["add", "bench", "build", "check", "clean", "clippy", "doc", "fmt", "init", "install", "new", "publish",
+        "run", "test", "update"],
+    "npm" => ["audit", "ci", "init", "install", "link", "list", "outdated", "publish", "run", "start", "test",
+        "uninstall", "update"],
+    "kubectl" => ["apply", "config", "create", "delete", "describe", "edit", "exec", "get", "logs", "port-forward",
+        "rollout", "scale"],
+    "systemctl" => ["daemon-reload", "disable", "enable", "restart", "start", "status", "stop"],
+};
+
+/// The optimal-string-alignment distance: insertions, deletions,
+/// substitutions and swaps of neighbours, each one edit.
+let distance : :string -> :string -> :integer;
+let distance a b = {
+    let xs = str.chars a;
+    let ys = str.chars b;
+    let first = list.range 0 (len ys + 1);
+    let rec rows i prev2 prev cs xprev = match cs {
+        [] => list.last prev,
+        _ => {
+            let x = list.head cs;
+            let rec cells j row_rev ys_left yprev = match ys_left {
+                [] => list.reverse row_rev,
+                _ => {
+                    let y = list.head ys_left;
+                    let cost = if x == y { 0 } else { 1 };
+                    let left = list.head row_rev;
+                    let up = list.nth j prev;
+                    let diag = list.nth (j - 1) prev;
+                    let best = num.min (num.min (left + 1) (up + 1)) (diag + cost);
+                    let swapped = if i > 1 && j > 1 && x == yprev && xprev == y { num.min best (list.nth (j - 2) prev2 + 1) } else { best };
+                    cells (j + 1) (list.cons swapped row_rev) (list.tail ys_left) y
+                },
+            };
+            let row = cells 1 [i] ys ' ';
+            rows (i + 1) prev row (list.tail cs) x
+        },
+    };
+    rows 1 first first xs ' '
+};
+
+/// Every program on `PATH`, by name.
+let programs! : :unit -> [:string];
+let programs! u = {
+    let dirs = match os.env! "PATH" { () => [], p => str.split ":" p };
+    list.unique (list.flat_map (fn d -> try! { list.map (fn f -> path_name f) (file.list! d) } catch e { [] }) dirs)
+};
+priv let path_name f = list.last (str.split "/" f);
+
+/// The best guesses for `word`, `[guess, probability]`, from `known` and how
+/// often each was used: at most two edits away, and never `word` itself.
+let guesses : :string -> [:string] -> %{:string => :integer} -> [[:any]];
+let guesses word known counts = {
+    let total = num.to_float (1 + map.fold (fn a k n -> a + n) 0 counts);
+    let near = list.flat_map (fn c -> {
+        let d = distance word c;
+        let limit = if str.length word <= 3 { 1 } else { 2 };
+        if c == word || d > limit || d == 0 { [] } else {
+            let prior = (num.to_float (counts.[c else 0]) + 0.5) / total;
+            [[c, prior * math.exp (-2.5 * num.to_float d)]]
+        }
+    }) known;
+    let sum = list.fold (fn a x -> a + list.nth 1 x) 0.0 near;
+    // A guess that much less likely than the best is noise, not a suggestion.
+    let ranked = list.map (fn x -> [list.head x, list.nth 1 x / sum]) (list.sort_by (fn a b -> list.nth 1 a > list.nth 1 b) near);
+    list.take 3 (list.filter (fn x -> list.nth 1 x >= 0.12) ranked)
+};
+
+/// Corrections of a command that failed: its program (when the shell could
+/// not find it) or its subcommand. `programs` are the names on PATH and
+/// `kinds` how often each program and `program sub` was run.
+let correct : :string -> :integer -> [:string] -> %{:string => :integer} -> [:string];
+let correct command exit programs kinds = {
+    let words = list.filter (fn w -> w != "") (str.split " " (str.trim command));
+    match words {
+        [] => [],
+        _ => {
+            let program = list.head words;
+            let rest = list.tail words;
+            let heads = map.from_pairs (list.flat_map (fn p -> if str.contains_str " " (list.head p) { [] } else { [p] }) (map.pairs kinds));
+            if exit == 127 {
+                let known = list.unique (list.append (map.keys heads) programs);
+                list.map (fn g -> str.join_str " " (list.cons (list.head g) rest)) (guesses program known heads)
+            } else {
+                match [subcommands.[program else ()], rest] {
+                    [(), _] => [],
+                    [_, []] => [],
+                    [subs, _] => {
+                        let used = map.from_pairs (list.flat_map (fn p -> match str.split_once " " (list.head p) {
+                            [h, s] => if h == program { [[s, list.nth 1 p]] } else { [] }, _ => [] }) (map.pairs kinds));
+                        let sub = list.head rest;
+                        if list.contains sub subs || map.has sub used { [] } else {
+                            list.map (fn g -> str.join_str " " (list.cons program (list.cons (list.head g) (list.tail rest))))
+                                (guesses sub (list.unique (list.append subs (map.keys used))) used)
+                        }
+                    },
+                }
+            }
+        },
+    }
+};
+
+when test {
+    import std.test;
+    let tests = [
+        test.case "a swap is one edit" $(test.eq! [1, 1, 2, 0, 3] [distance "gti" "git", distance "sl" "ls", distance "psuh" "push" + 1, distance "a" "a", distance "" "abc"]),
+        test.case "a missing program is guessed from PATH and use" $(test.eq! "git status"
+            (list.head (correct "gti status" 127 ["git", "gitk", "gzip"] %{"git" => 40, "git status" => 30}))),
+        test.case "a subcommand is guessed" $(test.eq! ["git push origin main"]
+            (list.take 1 (correct "git psuh origin main" 1 [] %{"git push" => 10}))),
+        test.case "a command that ran is not corrected" $(test.eq! [] (correct "git push" 1 [] %{})),
+    ];
+}

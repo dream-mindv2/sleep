@@ -1,0 +1,188 @@
+// Small animations for what the terminal is doing: waiting on a command, a
+// command that worked or failed, one that took a long while, the bell.
+//
+// Each is an overlay -- in the terminal's top-right corner, or around its
+// edge -- made of a few elements and the keyframes below, and nothing else:
+// no script, no images, nothing that takes the pointer or the focus, and
+// all of it stilled by `prefers-reduced-motion`. Which one plays for which
+// moment is a setting, and a person's own CSS (Settings, "Custom CSS") can
+// restyle any of them by their classes or add more.
+import std.graphics as ui;
+import std.graphics.css;
+import std.graphics.html;
+import std.list;
+
+priv let el classes children = ui.element "span" [html.class classes, html.aria "hidden" "true"] children;
+priv let bits name n = list.map (fn i -> el (name + " " + name + "-" + to_string i) []) (list.range 0 n);
+
+/// The overlay for an animation by name, `ui.nothing` for `"none"`.
+let overlay : :string -> ui.Node;
+let overlay name = match name {
+    "cat" => el "sl-anim sl-cat" [el "sl-cat-body" [el "sl-cat-ear sl-cat-ear-l" [], el "sl-cat-ear sl-cat-ear-r" [],
+        el "sl-cat-eye sl-cat-eye-l" [], el "sl-cat-eye sl-cat-eye-r" [], el "sl-cat-tail" []],
+        el "sl-z sl-z-0" [ui.text "z"], el "sl-z sl-z-1" [ui.text "z"], el "sl-z sl-z-2" [ui.text "Z"]],
+    "orbit" => el "sl-anim sl-orbit" (bits "sl-orbit-dot" 3),
+    "comet" => el "sl-edge sl-comet" [],
+    "aurora" => el "sl-edge sl-aurora" [],
+    "wave" => el "sl-anim sl-wave" (bits "sl-wave-bar" 5),
+    "hourglass" => el "sl-anim sl-hourglass" [ui.text "\u{231b}"],
+    "sparkle" => el "sl-anim sl-sparkle" (list.map (fn i -> el ("sl-spark sl-spark-" + to_string i) [ui.text "\u{2726}"]) (list.range 0 6)),
+    "check" => el "sl-anim sl-check" [ui.element "svg" [html.attr "viewBox" "0 0 24 24"] [
+        ui.element "circle" [html.attr "cx" "12", html.attr "cy" "12", html.attr "r" "10", html.class "sl-check-ring"] [],
+        ui.element "path" [html.attr "d" "M7 12.5l3.2 3.2L17 9", html.class "sl-check-mark"] []]],
+    "bloom" => el "sl-edge sl-bloom" [],
+    "shake" => el "sl-edge sl-shake" [],
+    "glow" => el "sl-edge sl-glow" [],
+    "glitch" => el "sl-anim sl-glitch" [ui.text "ERR"],
+    "confetti" => el "sl-edge sl-confetti" (bits "sl-confetti-bit" 14),
+    "fireworks" => el "sl-anim sl-fireworks" (list.map (fn i -> el ("sl-burst sl-burst-" + to_string i) (bits "sl-ray" 8)) (list.range 0 3)),
+    "ripple" => el "sl-edge sl-ripple" [],
+    "flash" => el "sl-edge sl-flash" [],
+    _ => ui.nothing,
+};
+
+/// The stylesheet the overlays are drawn with.
+let styles : [:string];
+let styles = list.concat [
+    [
+        css.rule ".sl-stage" %{ "position" => "relative", "display" => "flex", "flex-direction" => "column", "flex" => "1 1 0", "min-height" => "0", "min-width" => "0" },
+        css.rule ".sl-anim" %{ "position" => "absolute", "top" => "3.7rem", "right" => "1.4rem", "pointer-events" => "none", "z-index" => "3",
+            "color" => "var(--dw-accent)" },
+        css.rule ".sl-edge" %{ "position" => "absolute", "inset" => "2.75rem 0 0 0", "pointer-events" => "none", "z-index" => "2", "border-radius" => "4px",
+            "overflow" => "hidden" },
+        css.media "(prefers-reduced-motion: reduce)" [css.rule ".sl-anim, .sl-edge, .sl-anim *, .sl-edge *" %{ "animation" => "none !important", "display" => "none" }],
+    ],
+    // the sleepy cat: a round body, two ears, closed eyes, a swaying tail, and z's drifting up
+    [
+        css.rule ".sl-cat" %{ "width" => "46px", "height" => "40px" },
+        css.rule ".sl-cat-body" %{ "position" => "absolute", "left" => "4px", "bottom" => "0", "width" => "34px", "height" => "20px",
+            "border-radius" => "18px 18px 10px 10px", "background" => "color-mix(in srgb, var(--dw-accent) 70%, var(--dw-term-fg))",
+            "animation" => "sl-breathe 3.2s ease-in-out infinite", "transform-origin" => "50% 100%" },
+        css.rule ".sl-cat-ear" %{ "position" => "absolute", "top" => "-6px", "width" => "0", "height" => "0", "border-left" => "5px solid transparent",
+            "border-right" => "5px solid transparent", "border-bottom" => "8px solid color-mix(in srgb, var(--dw-accent) 70%, var(--dw-term-fg))" },
+        css.rule ".sl-cat-ear-l" %{ "left" => "4px", "transform" => "rotate(-12deg)" },
+        css.rule ".sl-cat-ear-r" %{ "left" => "14px", "transform" => "rotate(10deg)" },
+        css.rule ".sl-cat-eye" %{ "position" => "absolute", "top" => "8px", "width" => "6px", "height" => "3px",
+            "border-bottom" => "2px solid var(--dw-term-bg)", "border-radius" => "0 0 6px 6px" },
+        css.rule ".sl-cat-eye-l" %{ "left" => "5px" },
+        css.rule ".sl-cat-eye-r" %{ "left" => "15px" },
+        css.rule ".sl-cat-tail" %{ "position" => "absolute", "right" => "-9px", "bottom" => "2px", "width" => "14px", "height" => "5px",
+            "border-radius" => "4px", "background" => "inherit", "transform-origin" => "0 50%", "animation" => "sl-tail 2.4s ease-in-out infinite" },
+        css.rule ".sl-z" %{ "position" => "absolute", "left" => "30px", "bottom" => "16px", "font" => "700 11px var(--dw-font)",
+            "color" => "var(--dw-term-fg)", "opacity" => "0", "animation" => "sl-z 3s ease-in infinite" },
+        css.rule ".sl-z-1" %{ "animation-delay" => "1s", "font-size" => "13px" },
+        css.rule ".sl-z-2" %{ "animation-delay" => "2s", "font-size" => "15px" },
+        css.keyframes "sl-breathe" [["50%", %{ "transform" => "scaleY(1.08) scaleX(0.97)" }]],
+        css.keyframes "sl-tail" [["50%", %{ "transform" => "rotate(-35deg)" }]],
+        css.keyframes "sl-z" [["0%", %{ "opacity" => "0", "transform" => "translate(0, 0) rotate(-10deg)" }],
+            ["20%", %{ "opacity" => "0.9" }], ["100%", %{ "opacity" => "0", "transform" => "translate(14px, -26px) rotate(14deg)" }]],
+    ],
+    // orbiting dots, a wave of bars, an hourglass turning
+    [
+        css.rule ".sl-orbit" %{ "width" => "26px", "height" => "26px", "animation" => "sl-spin 1.6s linear infinite" },
+        css.rule ".sl-orbit-dot" %{ "position" => "absolute", "width" => "7px", "height" => "7px", "border-radius" => "50%",
+            "background" => "currentColor", "top" => "0", "left" => "9.5px", "transform-origin" => "3.5px 13px" },
+        css.rule ".sl-orbit-dot-1" %{ "transform" => "rotate(120deg)", "opacity" => "0.7" },
+        css.rule ".sl-orbit-dot-2" %{ "transform" => "rotate(240deg)", "opacity" => "0.4" },
+        css.keyframes "sl-spin" [["to", %{ "transform" => "rotate(360deg)" }]],
+        css.rule ".sl-wave" %{ "display" => "flex", "gap" => "3px", "align-items" => "flex-end", "height" => "18px" },
+        css.rule ".sl-wave-bar" %{ "width" => "4px", "height" => "100%", "border-radius" => "2px", "background" => "currentColor",
+            "animation" => "sl-bar 1s ease-in-out infinite", "transform-origin" => "50% 100%" },
+        css.rule ".sl-wave-bar-1" %{ "animation-delay" => "0.1s" },
+        css.rule ".sl-wave-bar-2" %{ "animation-delay" => "0.2s" },
+        css.rule ".sl-wave-bar-3" %{ "animation-delay" => "0.3s" },
+        css.rule ".sl-wave-bar-4" %{ "animation-delay" => "0.4s" },
+        css.keyframes "sl-bar" [["0%, 100%", %{ "transform" => "scaleY(0.25)" }], ["50%", %{ "transform" => "scaleY(1)" }]],
+        css.rule ".sl-hourglass" %{ "font-size" => "18px", "animation" => "sl-flip 2.4s ease-in-out infinite" },
+        css.keyframes "sl-flip" [["0%, 40%", %{ "transform" => "rotate(0)" }], ["50%, 90%", %{ "transform" => "rotate(180deg)" }], ["100%", %{ "transform" => "rotate(360deg)" }]],
+    ],
+    // a comet running round the edge, and an aurora along the top
+    [
+        css.rule ".sl-comet" %{ "padding" => "2px", "-webkit-mask" => "linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0)",
+            "-webkit-mask-composite" => "xor", "mask-composite" => "exclude" },
+        css.rule ".sl-comet::before" %{ "content" => "\"\"", "position" => "absolute", "inset" => "-50%",
+            "background" => "conic-gradient(from 0deg, transparent 0 78%, color-mix(in srgb, var(--dw-accent) 30%, transparent) 88%, var(--dw-accent) 99%, transparent 100%)",
+            "animation" => "sl-spin 2.6s linear infinite" },
+        css.rule ".sl-aurora" %{ "bottom" => "auto", "height" => "3px", "border-radius" => "0",
+            "background" => "linear-gradient(90deg, transparent, var(--dw-accent), var(--dw-ansi-6), var(--dw-ansi-5), transparent)",
+            "background-size" => "200% 100%", "animation" => "sl-slide 2.2s linear infinite", "filter" => "blur(0.5px)", "opacity" => "0.9" },
+        css.keyframes "sl-slide" [["from", %{ "background-position" => "200% 0" }], ["to", %{ "background-position" => "0 0" }]],
+    ],
+    // success: sparkles, a drawn check, a green bloom
+    [
+        css.rule ".sl-sparkle" %{ "width" => "40px", "height" => "34px", "color" => "var(--dw-ansi-11)" },
+        css.rule ".sl-spark" %{ "position" => "absolute", "font-size" => "12px", "opacity" => "0", "animation" => "sl-twinkle 1.4s ease-out forwards" },
+        css.rule ".sl-spark-0" %{ "left" => "4px", "top" => "14px" },
+        css.rule ".sl-spark-1" %{ "left" => "18px", "top" => "2px", "animation-delay" => "0.1s", "font-size" => "15px" },
+        css.rule ".sl-spark-2" %{ "left" => "30px", "top" => "16px", "animation-delay" => "0.2s" },
+        css.rule ".sl-spark-3" %{ "left" => "12px", "top" => "22px", "animation-delay" => "0.3s", "font-size" => "9px" },
+        css.rule ".sl-spark-4" %{ "left" => "26px", "top" => "4px", "animation-delay" => "0.35s", "font-size" => "9px" },
+        css.rule ".sl-spark-5" %{ "left" => "0", "top" => "2px", "animation-delay" => "0.45s", "font-size" => "10px" },
+        css.keyframes "sl-twinkle" [["0%", %{ "opacity" => "0", "transform" => "scale(0.2) rotate(0)" }],
+            ["40%", %{ "opacity" => "1", "transform" => "scale(1.2) rotate(40deg)" }], ["100%", %{ "opacity" => "0", "transform" => "scale(0.6) rotate(90deg)" }]],
+        css.rule ".sl-check svg" %{ "width" => "28px", "height" => "28px", "fill" => "none", "stroke" => "var(--dw-success)", "stroke-width" => "2",
+            "stroke-linecap" => "round", "stroke-linejoin" => "round", "animation" => "sl-fade 1.6s ease forwards" },
+        css.rule ".sl-check-ring" %{ "stroke-dasharray" => "63", "stroke-dashoffset" => "63", "animation" => "sl-draw 0.5s ease-out forwards" },
+        css.rule ".sl-check-mark" %{ "stroke-dasharray" => "16", "stroke-dashoffset" => "16", "animation" => "sl-draw 0.3s 0.4s ease-out forwards" },
+        css.keyframes "sl-draw" [["to", %{ "stroke-dashoffset" => "0" }]],
+        css.keyframes "sl-fade" [["0%, 70%", %{ "opacity" => "1" }], ["100%", %{ "opacity" => "0" }]],
+        css.rule ".sl-bloom" %{ "box-shadow" => "inset 0 0 0 2px var(--dw-success), inset 0 0 40px color-mix(in srgb, var(--dw-success) 30%, transparent)",
+            "animation" => "sl-fade-fast 1.2s ease-out forwards" },
+        css.keyframes "sl-fade-fast" [["0%", %{ "opacity" => "1" }], ["100%", %{ "opacity" => "0" }]],
+    ],
+    // failure: a shake, a red glow, a glitch
+    [
+        css.rule ".sl-shake" %{ "box-shadow" => "inset 0 0 0 2px var(--dw-danger)", "animation" => "sl-shake 0.45s ease-in-out, sl-fade-fast 1.3s 0.2s ease-out forwards" },
+        css.keyframes "sl-shake" [["20%", %{ "transform" => "translateX(-4px)" }], ["40%", %{ "transform" => "translateX(4px)" }],
+            ["60%", %{ "transform" => "translateX(-3px)" }], ["80%", %{ "transform" => "translateX(2px)" }]],
+        css.rule ".sl-glow" %{ "box-shadow" => "inset 0 0 50px color-mix(in srgb, var(--dw-danger) 35%, transparent), inset 0 0 0 1px var(--dw-danger)",
+            "animation" => "sl-pulse 0.7s ease-in-out 2, sl-fade-fast 1.6s 0.2s ease-out forwards" },
+        css.keyframes "sl-pulse" [["50%", %{ "opacity" => "0.4" }]],
+        css.rule ".sl-glitch" %{ "font" => "800 13px ui-monospace, monospace", "color" => "var(--dw-danger)", "letter-spacing" => "2px",
+            "text-shadow" => "2px 0 var(--dw-ansi-6), -2px 0 var(--dw-ansi-5)", "animation" => "sl-glitch 0.25s steps(2) 5, sl-fade 1.6s forwards" },
+        css.keyframes "sl-glitch" [["50%", %{ "transform" => "translate(2px, -1px) skewX(-8deg)", "clip-path" => "inset(30% 0 20% 0)" }]],
+    ],
+    // a long command finished: confetti and fireworks
+    [
+        css.rule ".sl-confetti-bit" %{ "position" => "absolute", "top" => "-8px", "width" => "6px", "height" => "10px", "border-radius" => "1px",
+            "opacity" => "0", "animation" => "sl-fall 1.8s ease-in forwards" },
+    ],
+    list.map (fn i -> css.rule (".sl-confetti-bit-" + to_string i) %{
+        "left" => to_string (5 + (i * 37) % 90) + "%", "animation-delay" => to_string ((i * 7) % 10 * 60) + "ms",
+        "background" => "var(--dw-ansi-" + to_string (9 + i % 6) + ")" }) (list.range 0 14),
+    [
+        css.keyframes "sl-fall" [["0%", %{ "opacity" => "1", "transform" => "translateY(0) rotate(0)" }],
+            ["100%", %{ "opacity" => "0", "transform" => "translateY(60vh) rotate(540deg)" }]],
+        css.rule ".sl-fireworks" %{ "width" => "90px", "height" => "60px" },
+        css.rule ".sl-burst" %{ "position" => "absolute", "width" => "2px", "height" => "2px", "animation" => "sl-fade 1.4s forwards" },
+        css.rule ".sl-burst-0" %{ "left" => "20px", "top" => "30px" },
+        css.rule ".sl-burst-1" %{ "left" => "55px", "top" => "18px", "animation-delay" => "0.25s" },
+        css.rule ".sl-burst-2" %{ "left" => "75px", "top" => "40px", "animation-delay" => "0.5s" },
+        css.rule ".sl-ray" %{ "position" => "absolute", "width" => "2px", "height" => "10px", "border-radius" => "1px", "background" => "var(--dw-ansi-11)",
+            "transform-origin" => "1px 0", "opacity" => "0", "animation" => "sl-ray 0.9s ease-out forwards", "animation-delay" => "inherit" },
+        css.rule ".sl-burst-1 .sl-ray" %{ "background" => "var(--dw-ansi-13)" },
+        css.rule ".sl-burst-2 .sl-ray" %{ "background" => "var(--dw-ansi-14)" },
+    ],
+    list.map (fn i -> css.rule (".sl-ray-" + to_string i) %{ "--sl-r" => to_string (i * 45) + "deg", "transform" => "rotate(" + to_string (i * 45) + "deg)" }) (list.range 0 8),
+    [
+        css.keyframes "sl-ray" [["0%", %{ "opacity" => "1", "transform" => "rotate(var(--sl-r)) translateY(0) scaleY(0.3)" }],
+            ["100%", %{ "opacity" => "0", "transform" => "rotate(var(--sl-r)) translateY(14px) scaleY(1)" }]],
+    ],
+    // the bell: a ripple from the middle, or a flash
+    [
+        css.rule ".sl-ripple::before" %{ "content" => "\"\"", "position" => "absolute", "left" => "50%", "top" => "50%", "width" => "40px", "height" => "40px",
+            "margin" => "-20px 0 0 -20px", "border-radius" => "50%", "border" => "2px solid var(--dw-accent)", "animation" => "sl-ripple 0.9s ease-out forwards" },
+        css.keyframes "sl-ripple" [["from", %{ "opacity" => "0.8", "transform" => "scale(0.2)" }], ["to", %{ "opacity" => "0", "transform" => "scale(12)" }]],
+        css.rule ".sl-flash" %{ "background" => "color-mix(in srgb, var(--dw-term-fg) 12%, transparent)", "animation" => "sl-fade-fast 0.35s ease-out forwards" },
+    ],
+];
+
+when test {
+    import std.test;
+    let tests = [
+        test.case "every animation the settings offer is drawn" $(test.eq! []
+            (list.filter (fn n -> ui.Node.tag (overlay n) == "#none")
+                ["cat", "orbit", "comet", "aurora", "wave", "hourglass", "sparkle", "check", "bloom", "shake", "glow", "glitch", "confetti", "fireworks", "ripple", "flash"])),
+        test.case "none is nothing" $(test.eq! "#none" (ui.Node.tag (overlay "none"))),
+    ];
+}

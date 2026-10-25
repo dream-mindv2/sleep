@@ -1,0 +1,427 @@
+// A terminal tab: the screen the backend's session describes, the keyboard
+// that goes back to it, and the assistant beside it.
+//
+// **The screen is the backend's.** The emulator runs natively, next to the
+// shell (`session.dr`); what arrives here is the lines it changed, by
+// number, and where the cursor is. This tab keeps the last 1,500 lines by
+// number and draws them with `std.graphics.widgets`' terminal, which draws
+// each line lazily, so a frame costs the lines in it.
+//
+// **Its size is measured, not guessed**: the width and height of ten
+// characters of its own face (the widget's probe), and of its box, give the
+// columns and rows the shell is told, again whenever the window changes.
+//
+// **The keyboard** goes through the window first, which takes the chords
+// that are shortcuts; the rest are encoded here (`keys.bytes`) and sent.
+// Right arrow at the end of what has been typed accepts the assistant's
+// suggestion instead, when there is one.
+import std.graphics as ui;
+import std.graphics.browser;
+import std.graphics.html;
+import std.graphics.widgets as w;
+import std.list;
+import std.map;
+import std.num;
+import std.str;
+import animations;
+import keys;
+import settings.{Settings};
+import settings;
+import ui_common;
+
+priv let keep = 1500;
+
+mapping Model {
+    id : :string = ""
+    session : :string = ""
+    opening : :bool = false
+    lines : %{:integer => :any} = %{}
+    first : :integer = 0
+    base : :integer = 0
+    rows : :integer = 24
+    cols : :integer = 80
+    cursor : :any = ()
+    cursor_visible : :bool = true
+    shape : :string = "block"
+    app_cursor : :bool = false
+    bracketed : :bool = false
+    alt : :bool = false
+    marks : %{:integer => :atom} = %{}
+    ghost : :string = ""
+    typed : :string = ""
+    title : :string = ""
+    cwd : :string = ""
+    program : :string = ""
+    exited : :any = ()
+    running : :any = ()
+    expected : :integer = 0
+    queue : [:string] = []
+    queue_open : :bool = false
+    queue_text : :string = ""
+    insight : :any = ()
+    blocks : [:any] = []
+    next : [:any] = []
+    ask : :string = ""
+    answers : [:any] = []
+    asking : :bool = false
+    focused : :bool = false
+    follow : :bool = true
+    cell : [:float] = [8.4, 18.2]
+    moment : :string = ""
+    moment_until : :integer = 0
+    moment_seq : :integer = 0
+}
+
+union Msg {
+    key(k : :any)
+    paste(s : :string)
+    compose(s : :string)
+    focused(b : :bool)
+    tap
+    tapped(r : Result :string :string)
+    wheel(v : :any)
+    measure
+    probed(r : Result :any :string)
+    boxed(r : Result :any :string)
+    opened(r : Result :any :string)
+    event(name : :string, v : :any)
+    expected(r : Result :any :string)
+    queue_toggle
+    queue_text(s : :string)
+    queue_submit
+    unqueue(i : :integer)
+    insert(command : :string)
+    run(command : :string)
+    jump(line : :integer)
+    ask_text(s : :string)
+    ask_submit
+    answered(r : Result :any :string)
+    predicted(r : Result :any :string)
+    interrupt
+    tick(now : :integer)
+}
+
+let new : :string -> :string -> Model;
+let new id cwd = Model.new () |> Model.set_id id |> Model.set_cwd cwd;
+
+priv let widget_key m = "term-" + Model.id m;
+let input_key : Model -> :string;
+let input_key m = widget_key m + "-input";
+
+/// The tab's title: what is running, or where the shell is.
+let title : Model -> :string;
+let title m = if Model.exited m != () { "exited" } else {
+    match Model.running m {
+        () => if Model.title m != "" { ui_common.clip 30 (Model.title m) } else { short_dir (Model.cwd m) },
+        r => ui_common.clip 30 (r.["command" else "running"]),
+    }
+};
+priv let short_dir d = if d == "" { "Terminal" } else { match list.last (str.split "/" d) { "" => "/", x => x } };
+
+/// The tab strip's dot for this tab.
+let state : Model -> :string;
+let state m = if Model.exited m != () { "" } else if Model.running m != () { "busy" } else {
+    match Model.insight m { () => "", i => if i.["exit" else 0] != 0 { "error" } else { "" } }
+};
+
+/// Whether something runs here that closing would stop.
+let busy : Model -> :bool;
+let busy m = Model.running m != () && Model.exited m == ();
+
+priv let send! m data = if Model.session m == "" || Model.exited m != () { () } else {
+    browser.invoke! "term_input" %{ "id" => Model.session m, "data" => data } (fn r -> ())
+};
+
+/// The frontend's clock from a message's time.
+priv let set_moment name until m = if name == "none" || name == "" { m } else {
+    m |> Model.set_moment name |> Model.set_moment_until until |> Model.set_moment_seq (Model.moment_seq m + 1)
+};
+
+/// A frame from the session: its lines put in, the oldest dropped.
+priv let apply_screen v m = {
+    let reset = v.["reset" else false];
+    let base = v.["base" else 0];
+    let kept = if reset { map.filter (fn n l -> n < base) (Model.lines m) } else { Model.lines m };
+    let with_lines = list.fold (fn acc nl -> acc.[list.head nl => list.nth 1 nl]) kept (v.["lines" else []]);
+    let total = base + v.["rows" else 24];
+    let floor = num.max (v.["first" else 0]) (total - keep);
+    let trimmed = if map.size with_lines > keep + 200 { map.filter (fn n l -> n >= floor) with_lines } else { with_lines };
+    let marks = list.fold (fn acc mk -> acc.[list.head mk => match list.nth 1 mk { "ok" => :ok, "error" => :error, _ => :running }])
+        (if v.["first" else 0] > Model.first m { map.filter (fn n k -> n >= floor) (Model.marks m) } else { Model.marks m }) (v.["marks" else []]);
+    m |> Model.set_lines trimmed |> Model.set_first floor |> Model.set_base base |> Model.set_rows (v.["rows" else 24])
+      |> Model.set_cols (v.["cols" else 80]) |> Model.set_cursor (v.["cursor" else ()]) |> Model.set_cursor_visible (v.["cursor_visible" else true])
+      |> Model.set_shape (v.["cursor_shape" else "block"]) |> Model.set_app_cursor (v.["app_cursor" else false])
+      |> Model.set_bracketed (v.["bracketed" else false]) |> Model.set_alt (v.["alt" else false]) |> Model.set_marks marks
+      |> Model.set_typed (v.["typed" else ""]) |> Model.set_ghost (if v.["typed" else ""] == Model.typed m { Model.ghost m } else { v.["ghost" else ""] })
+      |> Model.set_running (v.["running" else ()])
+};
+
+/// The size the box holds, in cells: the widget's padding (8 px by 12 px)
+/// taken off, then the cell's width and height.
+priv let fit m box = {
+    let [cw, ch] = Model.cell m;
+    let cols = num.max 10 (num.to_int ((box.["width" else 640.0] - 24.0) / cw));
+    let rows = num.max 3 (num.to_int ((box.["height" else 400.0] - 16.0) / ch));
+    [cols, rows]
+};
+
+let update! : (Msg -> :any) -> Settings -> Msg -> Model -> Model;
+let update! wrap s msg m = match msg {
+    Msg.key(k) => {
+        let at_end = Model.ghost m != "" && k.["key" else ""] == "ArrowRight" && not (k.["ctrl" else false] || k.["alt" else false] || k.["shift" else false]);
+        if at_end { send! m (Model.ghost m); m |> Model.set_ghost "" |> Model.set_follow true }
+        else {
+            let bytes = keys.bytes k (Model.app_cursor m);
+            if bytes != "" { send! m bytes }
+            if bytes == "" { m } else { Model.set_follow true m }
+        }
+    },
+    Msg.paste(text) => { send! m (keys.paste text (Model.bracketed m)); Model.set_follow true m },
+    Msg.compose(text) => { if text != "" { send! m text }; m },
+    Msg.focused(b) => Model.set_focused b m,
+    Msg.tap => { browser.selected_text! (fn r -> wrap (Msg.tapped r)); m },
+    Msg.tapped(r) => match r {
+        Result.ok("") => { browser.focus! (input_key m); m },
+        Result.ok(text) => { if Settings.copy_on_select s { browser.copy! text }; m },
+        _ => { browser.focus! (input_key m); m },
+    },
+    Msg.wheel(v) => if v.["dy" else 0] < 0 { Model.set_follow false m } else { m },
+    Msg.measure => { browser.measure! (widget_key m + "-probe") (fn r -> wrap (Msg.probed r)); m },
+    Msg.probed(r) => match r {
+        Result.ok(box) => {
+            let cw = box.["width" else 84.0] / 10.0;
+            let ch = box.["height" else 18.0];
+            browser.measure! (widget_key m) (fn r2 -> wrap (Msg.boxed r2))
+            if cw > 1.0 && ch > 1.0 { Model.set_cell [cw, ch] m } else { m }
+        },
+        Result.error(_) => m,
+    },
+    Msg.boxed(r) => match r {
+        Result.ok(box) => {
+            let [cols, rows] = fit m box;
+            if Model.session m == "" && not (Model.opening m) {
+                browser.invoke! "term_open" %{ "cols" => cols, "rows" => rows, "cwd" => Model.cwd m } (fn r2 -> wrap (Msg.opened r2))
+                m |> Model.set_opening true |> Model.set_cols cols |> Model.set_rows rows
+            } else if Model.session m != "" && (cols != Model.cols m || rows != Model.rows m) {
+                browser.invoke! "term_resize" %{ "id" => Model.session m, "cols" => cols, "rows" => rows } (fn r2 -> ())
+                m |> Model.set_cols cols |> Model.set_rows rows
+            } else { m }
+        },
+        Result.error(_) => m,
+    },
+    Msg.opened(r) => match r {
+        Result.ok(v) => {
+            browser.focus! (input_key m)
+            m |> Model.set_session (v.["id" else ""]) |> Model.set_opening false
+        },
+        Result.error(why) => m |> Model.set_opening false |> Model.set_exited (-1) |> Model.set_title ("could not start: " + why),
+    },
+    Msg.event(name, v) => match name {
+        "screen" => {
+            let n = apply_screen v m;
+            if Model.follow n { browser.scroll_to_end! (widget_key n) }
+            n
+        },
+        "status" => m |> Model.set_title (if v.["title" else ""] != "" { v.["title"] } else { Model.title m })
+            |> Model.set_cwd (if v.["cwd" else ""] != "" { v.["cwd"] } else { Model.cwd m })
+            |> Model.set_program (v.["program" else ""]),
+        "started" => {
+            browser.invoke! "assist_expected" %{ "command" => v.["command" else ""] } (fn r -> wrap (Msg.expected r))
+            m |> Model.set_expected 0 |> Model.set_ghost "" |> Model.set_next []
+        },
+        "block" => {
+            let d = v.["duration" else 0];
+            let anim = if not (Settings.animations s) { "none" }
+                else if v.["exit" else 0] != 0 { Settings.anim_failure s }
+                else if d >= 10000 { Settings.anim_long s } else if d >= 600 { Settings.anim_success s } else { "none" };
+            m |> Model.set_blocks (list.take 40 (list.cons v (Model.blocks m))) |> Model.set_running ()
+              |> set_moment anim (-1)
+        },
+        "insight" => Model.set_insight v (Model.set_next (v.["next" else []]) m),
+        "ghost" => Model.set_ghost (v.["ghost" else ""]) m,
+        "queue" => Model.set_queue (v.["queue" else []]) m,
+        "bell" => if Settings.animations s && Settings.bell s { set_moment (Settings.anim_bell s) (-1) m } else { m },
+        "exit" => m |> Model.set_exited (v.["code" else 0]) |> Model.set_running () |> Model.set_cursor (),
+        _ => m,
+    },
+    Msg.expected(r) => match r { Result.ok(ms) => if type_of ms == :integer { Model.set_expected ms m } else { m }, _ => m },
+    Msg.queue_toggle => {
+        let open = not (Model.queue_open m);
+        if not open { browser.focus! (input_key m) }
+        Model.set_queue_open open m
+    },
+    Msg.queue_text(t) => Model.set_queue_text t m,
+    Msg.queue_submit => if str.trim (Model.queue_text m) == "" { m } else {
+        browser.invoke! "term_queue" %{ "id" => Model.session m, "command" => Model.queue_text m } (fn r -> ())
+        m |> Model.set_queue_text "" |> Model.set_queue (list.append (Model.queue m) [str.trim (Model.queue_text m)])
+    },
+    Msg.unqueue(i) => {
+        browser.invoke! "term_unqueue" %{ "id" => Model.session m, "index" => i } (fn r -> ())
+        m
+    },
+    Msg.insert(c) => { send! m c; browser.focus! (input_key m); m },
+    Msg.run(c) => { send! m (c + "\r"); browser.focus! (input_key m); Model.set_follow true m },
+    Msg.jump(line) => { browser.scroll_to! (widget_key m + "-l" + to_string line); Model.set_follow false m },
+    Msg.ask_text(t) => Model.set_ask t m,
+    Msg.ask_submit => if str.trim (Model.ask m) == "" { m } else {
+        browser.invoke! "assist_ask" %{ "question" => Model.ask m } (fn r -> wrap (Msg.answered r))
+        Model.set_asking true m
+    },
+    Msg.answered(r) => match r { Result.ok(list_) => m |> Model.set_answers list_ |> Model.set_asking false, _ => Model.set_asking false m },
+    Msg.predicted(r) => match r { Result.ok(list_) => Model.set_next list_ m, _ => m },
+    Msg.interrupt => {
+        browser.invoke! "term_signal" %{ "id" => Model.session m, "signal" => "interrupt" } (fn r -> ())
+        m
+    },
+    Msg.tick(now) => {
+        let running_anim = if Model.running m != () && Settings.animations s { Settings.anim_running s } else { "none" };
+        let started = match Model.running m { () => now, r => r.["started" else now] };
+        if Model.moment_until m == -1 { Model.set_moment_until (now + 2200) m }
+        else if Model.moment m != "" && Model.moment_until m > 0 && now > Model.moment_until m && not (Model.moment m == running_anim) {
+            m |> Model.set_moment "" |> Model.set_moment_until 0
+        } else if running_anim != "none" && now - started > 900 && Model.moment m == "" {
+            m |> Model.set_moment running_anim |> Model.set_moment_until 0 |> Model.set_moment_seq (Model.moment_seq m + 1)
+        } else if Model.running m == () && Model.moment m == running_anim && Model.moment_until m == 0 {
+            m |> Model.set_moment ""
+        } else { m }
+    },
+};
+
+/// Whether the tab wants the clock: a command running, or an animation to end.
+let ticking : Model -> :bool;
+let ticking m = Model.running m != () || Model.moment m != "";
+
+// --- the view ------------------------------------------------------------------------
+
+priv let shown_lines m = {
+    let total = Model.base m + Model.rows m;
+    let from = if Model.alt m { Model.base m } else { num.max (Model.first m) (total - keep) };
+    [from, list.map (fn n -> (Model.lines m).[n else []]) (list.range from total)]
+};
+
+priv let running_bar m now = match Model.running m {
+    () => ui.nothing,
+    r => {
+        let elapsed = num.max 0 (now - r.["started" else now]);
+        let expected = Model.expected m;
+        w.row [
+            w.spinner |> w.width "0.9rem" |> w.height "0.9rem",
+            w.code (ui_common.clip 40 (r.["command" else ""])),
+            w.caption (ui_common.duration elapsed + (if expected > 0 { " of about " + ui_common.duration expected } else { "" })),
+            if expected > 0 { w.progress (num.to_float (num.min elapsed expected) / num.to_float expected) |> w.width "6rem" } else { ui.nothing },
+        ] |> w.gap 2
+    },
+};
+
+priv let queue_popup wrap m = if not (Model.queue_open m) { ui.nothing } else {
+    ui.element "div" [html.class "sl-queue dw-card"] [
+        w.row [w.icon "layers", w.strong "Queue", w.spacer, w.caption "runs when the current command finishes",
+            w.icon_button "x" "Close" (wrap Msg.queue_toggle) |> w.ghost |> w.small],
+        w.text_field "Command to queue" (Model.queue_text m) (fn t -> wrap (Msg.queue_text t)) |> w.quiet_label |> w.mono
+            |> w.placeholder "next command…" |> w.on_enter (wrap Msg.queue_submit) |> w.autofocus,
+        if Model.queue m == [] { w.caption "Nothing queued." } else {
+            w.column (list.map_indexed (fn i c -> w.row [w.badge (to_string (i + 1)), w.code c |> w.grow,
+                w.icon_button "x" "Remove" (wrap (Msg.unqueue i)) |> w.ghost |> w.small] |> ui.keyed ("q" + to_string i)) (Model.queue m)) |> w.gap 1
+        },
+    ]
+};
+
+priv let assistant wrap m status = {
+    let insight = Model.insight m;
+    w.sidebar [
+        w.row [w.icon "sparkles", w.strong "Assistant", w.spacer,
+            if status == () || not (status.["ready" else false]) { w.badge "learning" } else if status.["training" else false] { w.badge "training" |> w.tone :info }
+            else { ui.nothing }],
+        if Model.next m == [] { ui.nothing } else {
+            w.section "Next, probably" [w.column (list.map_indexed (fn i p ->
+                w.chip (ui_common.clip 34 p.["command"]) (wrap (Msg.insert p.["command"])) |> w.tooltip (p.["command"] + "  ·  " + ui_common.percent p.["p"])
+                    |> ui.keyed ("n" + to_string i)) (Model.next m)) |> w.gap 1 |> w.align :start]
+        },
+        match insight {
+            () => ui.nothing,
+            i => if i.["exit" else 0] == 0 && i.["summary" else []] == [] { ui.nothing } else { w.section "Last command" [
+                w.row [w.badge (if i.["exit"] == 0 { "ok" } else { "exit " + to_string i.["exit"] }) |> w.tone (if i.["exit"] == 0 { :success } else { :danger }),
+                       w.code (ui_common.clip 28 i.["command"])],
+                if i.["fixes" else []] == [] { ui.nothing } else {
+                    w.column (list.cons (w.caption "Did you mean") (list.map_indexed (fn j f -> w.chip f (wrap (Msg.run f)) |> ui.keyed ("f" + to_string j)) i.["fixes"])) |> w.gap 1 |> w.align :start
+                },
+                w.column (list.map_indexed (fn j c -> w.card [
+                    w.text c.["meaning"],
+                    if c.["fix" else ""] == "" { ui.nothing } else { w.row [w.code c.["fix"] |> w.grow, w.icon_button "edit" "Type it" (wrap (Msg.insert c.["fix"])) |> w.ghost |> w.small] },
+                    w.link "show the line" "#" |> ui.on "click" (wrap (Msg.jump c.["line"])),
+                ] |> w.padding 3 |> ui.keyed ("c" + to_string j)) (i.["causes" else []])) |> w.gap 2,
+                if i.["errors" else []] == [] { ui.nothing } else {
+                    w.button_with "alert" (to_string (len i.["errors"]) + " error line" + (if len i.["errors"] == 1 { "" } else { "s" })) (wrap (Msg.jump (list.head i.["errors"]))) |> w.small |> w.danger
+                },
+                if i.["summary" else []] == [] { ui.nothing } else {
+                    w.column (list.cons (w.caption "Worth reading") (list.map (fn n -> w.link ("line " + to_string n) "#" |> ui.on "click" (wrap (Msg.jump n))) i.["summary"])) |> w.gap 1
+                },
+            ] },
+        },
+        w.section "Ask" [
+            w.text_field "Ask for a command" (Model.ask m) (fn t -> wrap (Msg.ask_text t)) |> w.quiet_label
+                |> w.placeholder "find files bigger than 1 GB" |> w.on_enter (wrap Msg.ask_submit),
+            if Model.asking m { w.spinner } else { ui.nothing },
+            w.column (list.map_indexed (fn j a -> w.column [
+                w.row [w.code a.["command"] |> w.grow, w.icon_button "edit" "Type it" (wrap (Msg.insert a.["command"])) |> w.ghost |> w.small],
+                w.caption a.["note"],
+            ] |> w.gap 1 |> ui.keyed ("a" + to_string j)) (list.take 4 (Model.answers m))) |> w.gap 3,
+        ],
+        if Model.blocks m == [] { ui.nothing } else {
+            w.section "Recent" [w.column (list.map_indexed (fn j b -> w.row [
+                w.badge (if b.["exit"] == 0 { "✓" } else { to_string b.["exit"] }) |> w.tone (if b.["exit"] == 0 { :success } else { :danger }),
+                w.link (ui_common.clip 26 b.["command"]) "#" |> ui.on "click" (wrap (Msg.jump b.["prompt_line"])) |> w.grow,
+                w.caption (ui_common.duration b.["duration"]),
+            ] |> w.gap 2 |> ui.keyed ("b" + to_string j)) (list.take 8 (Model.blocks m))) |> w.gap 1]
+        },
+    ] |> w.width "19rem"
+};
+
+let view : (Msg -> :any) -> Settings -> :any -> :integer -> Model -> ui.Node;
+let view wrap s status now m = {
+    let [from, lines] = shown_lines m;
+    let term = w.terminal (w.Terminal.new () |> w.Terminal.set_key (widget_key m) |> w.Terminal.set_lines lines |> w.Terminal.set_first from
+        |> w.Terminal.set_marks (if Model.alt m { %{} } else { Model.marks m })
+        |> w.Terminal.set_cursor (if Model.cursor_visible m { Model.cursor m } else { () })
+        |> w.Terminal.set_cursor_shape (match Model.shape m { "bar" => :bar, "underline" => :underline, _ => Settings.cursor s })
+        |> w.Terminal.set_focused (Model.focused m) |> w.Terminal.set_ghost (if Settings.autosuggest s { Model.ghost m } else { "" })
+        |> w.Terminal.set_font_size (Settings.font_size s) |> w.Terminal.set_line_height (Settings.line_height s)
+        |> (fn t -> if Settings.font s == "" { t } else { w.Terminal.set_font (Settings.font s + ", ui-monospace, monospace") t })
+        |> w.Terminal.set_on_key (fn k -> wrap (Msg.key k)) |> w.Terminal.set_on_paste (fn t -> wrap (Msg.paste t))
+        |> w.Terminal.set_on_compose (fn t -> wrap (Msg.compose t)) |> w.Terminal.set_on_focus (wrap (Msg.focused true))
+        |> w.Terminal.set_on_blur (wrap (Msg.focused false)) |> w.Terminal.set_on_tap (wrap Msg.tap));
+    let stage = ui.element "div" [html.class "sl-stage"] [
+        w.toolbar [
+            w.icon "folder", w.code (ui_common.clip 48 (Model.cwd m)),
+            if Model.program m != "" && Model.running m != () { w.badge (Model.program m) } else { ui.nothing },
+            running_bar m now,
+            w.spacer,
+            if Model.exited m != () { w.badge ("exited " + to_string (Model.exited m)) |> w.tone :warning } else { ui.nothing },
+            if Model.running m != () { w.icon_button "stop" "Interrupt" (wrap Msg.interrupt) |> w.ghost |> w.small } else { ui.nothing },
+            w.button_with "layers" (if Model.queue m == [] { "Queue" } else { "Queue · " + to_string (len (Model.queue m)) }) (wrap Msg.queue_toggle)
+                |> w.ghost |> w.small |> w.tooltip ("Queue a command (" + settings.chord_for s "queue_command" + ")"),
+        ] |> w.gap 2,
+        term,
+        if Model.moment m == "" { ui.nothing } else { animations.overlay (Model.moment m) |> ui.keyed ("anim-" + Model.id m + "-" + to_string (Model.moment_seq m)) },
+        queue_popup wrap m,
+    ];
+    if Settings.assistant_open s { w.workspace [stage, assistant wrap m status] } else { w.workspace [stage] }
+};
+
+when test {
+    import std.test;
+    let tests = [
+        test.case "a frame puts its lines in by number" $({
+            let m = apply_screen %{ "lines" => [[3, [["$ ls", "", "", 0]]]], "base" => 2, "rows" => 4, "cursor" => [3, 4], "marks" => [[3, "ok"]] } (new "a" "");
+            test.eq! [[["$ ls", "", "", 0]], [3, 4], :ok] [(Model.lines m).[3], Model.cursor m, (Model.marks m).[3]]
+        }),
+        test.case "a reset forgets the screen but keeps the history" $({
+            let m = apply_screen %{ "lines" => [[0, [["old", "", "", 0]]], [5, [["screen", "", "", 0]]]], "base" => 4, "rows" => 2 } (new "a" "");
+            let m2 = apply_screen %{ "lines" => [], "base" => 4, "rows" => 2, "reset" => true } m;
+            test.eq! [true, false] [map.has 0 (Model.lines m2), map.has 5 (Model.lines m2)]
+        }),
+        test.case "the box gives the grid's size" $(test.eq! [76, 21] (fit (new "a" "" |> Model.set_cell [8.0, 18.0]) %{ "width" => 632.0, "height" => 400.0 })),
+        test.case "a title says what runs, or where" $(test.eq! ["app", "make -j8"]
+            [title (new "a" "/home/me/app"), title (new "a" "" |> Model.set_running %{ "command" => "make -j8" })]),
+    ];
+}

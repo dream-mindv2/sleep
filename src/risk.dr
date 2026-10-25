@@ -1,0 +1,94 @@
+// How likely a command is to do something that cannot be taken back, asked
+// as Enter is pressed and before the shell has seen it.
+//
+// A logistic model over features of the command: what it is (`rm`, `dd`,
+// `mkfs`, a force-push), what it is aimed at (`/`, `~`, a device, every file
+// here), and how it is run (`sudo`, piped into a shell, recursive and
+// forced together). Each feature has a weight; the probability is the
+// logistic of their sum, and the reasons shown are the features that fired,
+// heaviest first. The weights are set by hand from what each does, which is
+// the honest choice for a model whose positive examples are disasters.
+//
+// What the person says they meant teaches it: a command allowed twice is
+// trusted from then on (`allowed`), so the guard stops asking about the
+// `git push --force` someone runs on their own branch every day.
+import std.list;
+import std.map;
+import std.math;
+import std.regex;
+import std.str;
+
+/// A feature: its pattern, its weight, and what to say when it fires.
+priv let feature pattern weight reason = [Result.unwrap_or () (regex.parse pattern), weight, reason];
+
+/// The same, matched whatever the case: SQL's keywords.
+priv let feature_ci pattern weight reason = [Result.unwrap_or () (regex.parse_with [:ignore_case] pattern), weight, reason];
+
+priv let features = [
+    feature "\\brm\\s+(-[a-zA-Z]*[rR][a-zA-Z]*\\s+-?[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*[rR]|-[a-zA-Z]*[rR][a-zA-Z]*f|--recursive\\s+--force|-rf|-fr)" 2.2 "deletes recursively, without asking",
+    feature "\\brm\\b.*\\s(/|/\\*|~|~/|\\$HOME|\\*|\\.|\\.\\.)(\\s|$)" 3.4 "aimed at the root, the home directory, or everything here",
+    feature "\\brm\\b.*\\s/(bin|boot|dev|etc|lib|lib64|usr|var|sys|proc|opt|home)(/?\\s|/?$)" 3.0 "aimed at a system directory",
+    feature "--no-preserve-root" 4.0 "with the root's protection turned off",
+    feature "\\bdd\\b.*\\bof=/dev/(sd|nvme|hd|vd|mmcblk|disk)" 4.5 "writes straight over a disk",
+    feature "\\bmkfs(\\.\\w+)?\\b" 4.0 "formats a filesystem",
+    feature "\\b(wipefs|shred)\\b" 3.5 "destroys data on purpose",
+    feature ">\\s*/dev/(sd|nvme|hd|vd|mmcblk)" 4.5 "writes over a disk",
+    feature ":\\(\\)\\s*\\{\\s*:\\|:&\\s*\\};:" 5.0 "is a fork bomb",
+    feature "\\bchmod\\s+(-R\\s+)?[0-7]*777\\s+/(\\s|$)" 3.5 "opens the whole filesystem to everyone",
+    feature "\\bchmod\\b.*-R" 0.8 "changes permissions recursively",
+    feature "\\bchown\\b.*-R.*\\s/(\\s|$)" 3.5 "changes the owner of the whole filesystem",
+    feature "(curl|wget)\\b[^|]*\\|\\s*(sudo\\s+)?(ba|z|k|da)?sh\\b" 2.6 "runs a script straight from the internet",
+    feature "\\bgit\\s+push\\b.*(--force\\b|\\s-f\\b)" 1.6 "rewrites the remote's history",
+    feature "\\bgit\\s+push\\b.*(--force|-f).*\\b(main|master|trunk|release)\\b" 2.2 "on a shared branch",
+    feature "\\bgit\\s+reset\\s+--hard\\b" 1.7 "throws away uncommitted work",
+    feature "\\bgit\\s+clean\\s+-[a-zA-Z]*f[a-zA-Z]*d|\\bgit\\s+clean\\s+-[a-zA-Z]*d[a-zA-Z]*f" 1.8 "deletes untracked files",
+    feature "\\bgit\\s+checkout\\s+--\\s+\\." 1.2 "throws away changes to every file",
+    feature_ci "\\bdrop\\s+(table|database|schema)\\b" 2.6 "drops a database object",
+    feature_ci "\\btruncate\\s+table\\b" 2.2 "empties a table",
+    feature "\\b(shutdown|poweroff|halt|reboot|init\\s+0)\\b" 2.4 "turns the machine off or restarts it",
+    feature "\\bkill(all)?\\s+-9\\s+-1\\b" 4.0 "kills every process you own",
+    feature "\\bsudo\\b" 0.9 "as root",
+    feature "\\bmv\\b.*\\s/dev/null(\\s|$)" 2.5 "moves something into nothing",
+    feature "\\b(docker|podman)\\s+system\\s+prune\\b.*-a" 1.5 "removes every unused image",
+    feature "\\bkubectl\\s+delete\\b" 1.6 "deletes cluster resources",
+    feature "\\bterraform\\s+destroy\\b" 3.0 "destroys infrastructure",
+    feature "\\b(crontab\\s+-r)\\b" 2.5 "deletes every scheduled job",
+    feature "\\bhistory\\s+-c\\b" 1.0 "erases the shell's history",
+];
+
+/// The command's probability of being destructive, and why: `[p, reasons]`.
+let score : :string -> [:any];
+let score command = {
+    let fired = list.filter (fn f -> list.head f != () && regex.is_match (list.head f) command) features;
+    let total = list.fold (fn a f -> a + list.nth 1 f) 0.0 fired;
+    let p = 1.0 / (1.0 + math.exp (3.5 - total));
+    [if fired == [] { 0.0 } else { p }, list.map (fn f -> list.nth 2 f) (list.sort_by (fn a b -> list.nth 1 a > list.nth 1 b) fired)]
+};
+
+/// How sure the model must be before it asks.
+let threshold : :float;
+let threshold = 0.5;
+
+/// Whether to ask before running `command`, given what has been allowed:
+/// `[ask, p, reasons]`.
+let check : :string -> %{:string => :integer} -> [:any];
+let check command allowed = {
+    let [p, reasons] = score command;
+    let trusted = allowed.[str.trim command else 0] >= 2;
+    [p >= threshold && not trusted, p, reasons]
+};
+
+when test {
+    import std.test;
+    let asks = fn c -> list.head (check c %{});
+    let tests = [
+        test.case "the commands that cannot be undone are caught" $(test.eq! [true, true, true, true, true, true]
+            [asks "rm -rf /", asks "sudo rm -rf ~", asks "dd if=x.iso of=/dev/sda bs=4M", asks "curl -s https://x.sh | sudo bash",
+             asks "git push --force origin main", asks ":(){ :|:& };:"]),
+        test.case "everyday commands are not" $(test.eq! [false, false, false, false, false, false]
+            [asks "rm notes.txt", asks "rm -rf build", asks "git push", asks "ls -la /", asks "sudo apt update", asks "git status"]),
+        test.case "a command allowed twice is trusted" $(test.eq! false (list.head (check "git push --force origin main" %{"git push --force origin main" => 2}))),
+        test.case "the reasons come heaviest first" $(test.eq! "aimed at the root, the home directory, or everything here"
+            (list.head (list.nth 1 (score "rm -rf /")))),
+    ];
+}

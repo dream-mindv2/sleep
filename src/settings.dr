@@ -1,0 +1,168 @@
+// What a person can change: how sleep looks, which shell it starts, what the
+// assistant does, and every keyboard shortcut. One record, with a default
+// for every field, kept as JSON in the person's config directory and read
+// back field by field -- so a file written by an older sleep, missing what
+// was added since, still loads, and a field it does not know is ignored.
+import std.json;
+import std.list;
+import std.map;
+import keys;
+
+/// The things a shortcut can do, in the order Settings lists them, with
+/// their default chords and what Settings calls them.
+let actions : [[:string]];
+let actions = [
+    ["palette", "Ctrl+Shift+P", "Command palette"],
+    ["new_terminal", "Ctrl+Shift+T", "New terminal tab"],
+    ["new_request", "Ctrl+Shift+R", "New request tab"],
+    ["new_database", "Ctrl+Shift+D", "New database tab"],
+    ["open_settings", "Ctrl+,", "Open settings"],
+    ["close_tab", "Ctrl+Shift+W", "Close tab"],
+    ["next_tab", "Ctrl+Tab", "Next tab"],
+    ["previous_tab", "Ctrl+Shift+Tab", "Previous tab"],
+    ["queue_command", "Ctrl+Shift+Q", "Queue a command"],
+    ["ask", "Ctrl+Shift+Space", "Ask for a command"],
+    ["history", "Ctrl+Shift+H", "Search history"],
+    ["toggle_assistant", "Ctrl+Shift+A", "Show or hide the assistant"],
+    ["copy", "Ctrl+Shift+C", "Copy selection"],
+    ["find", "Ctrl+Shift+F", "Find in scrollback"],
+    ["bigger", "Ctrl+=", "Larger text"],
+    ["smaller", "Ctrl+-", "Smaller text"],
+    ["reset_size", "Ctrl+0", "Default text size"],
+    ["clear", "Ctrl+Shift+K", "Clear scrollback"],
+];
+
+/// `scheme` is a colour scheme's id (`schemes.dr`); `theme` is the window's
+/// light or dark, `:auto` to follow the scheme; `accent` overrides the
+/// scheme's accent when it is not `""`.
+mapping Settings {
+    scheme : :string = "sleep-dark"
+    theme : :atom = :auto
+    accent : :string = ""
+    font_size : :integer = 14
+    font : :string = ""
+    line_height : :float = 1.3
+    cursor : :atom = :block
+    shell : :string = ""
+    scrollback : :integer = 5000
+    copy_on_select : :bool = false
+    bell : :bool = true
+    confirm_close : :bool = true
+    integration : :bool = true
+    autosuggest : :bool = true
+    predictions : :bool = true
+    risk_guard : :bool = true
+    explain : :bool = true
+    train : :bool = true
+    assistant_open : :bool = true
+    animations : :bool = true
+    anim_running : :string = "cat"
+    anim_success : :string = "sparkle"
+    anim_failure : :string = "shake"
+    anim_long : :string = "confetti"
+    anim_bell : :string = "ripple"
+    custom_css : :string = ""
+    keys : %{:string => :string} = %{}
+}
+
+/// The animations each moment can have, `"none"` first.
+let running_animations : [[:string]];
+let running_animations = [["none", "None"], ["cat", "Sleepy cat"], ["orbit", "Orbiting dots"], ["comet", "Comet around the edge"],
+    ["aurora", "Aurora"], ["wave", "Little wave"], ["hourglass", "Hourglass"]];
+let success_animations : [[:string]];
+let success_animations = [["none", "None"], ["sparkle", "Sparkles"], ["check", "Check mark"], ["bloom", "Green bloom"]];
+let failure_animations : [[:string]];
+let failure_animations = [["none", "None"], ["shake", "Shake"], ["glow", "Red glow"], ["glitch", "Glitch"]];
+let long_animations : [[:string]];
+let long_animations = [["none", "None"], ["confetti", "Confetti"], ["fireworks", "Fireworks"], ["sparkle", "Sparkles"]];
+let bell_animations : [[:string]];
+let bell_animations = [["none", "None"], ["ripple", "Ripple"], ["flash", "Flash"]];
+
+/// The chord for `action`: the person's, or its default.
+let chord_for : Settings -> :string -> :string;
+let chord_for s action = match (Settings.keys s).[action else ()] {
+    () => match list.find (fn a -> list.head a == action) actions { () => "", a => list.nth 1 a },
+    c => c,
+};
+
+/// The action a chord is bound to, or `""`.
+let action_for : Settings -> :string -> :string;
+let action_for s chord = match list.find (fn a -> keys.canonical (chord_for s (list.head a)) == chord) actions {
+    () => "",
+    a => list.head a,
+};
+
+priv let atom_of options default v = match list.find (fn o -> atom_text o == v) options { () => default, o => o };
+priv let atom_text a = match a { :dark => "dark", :light => "light", :auto => "auto", :block => "block", :bar => "bar", :underline => "underline", _ => "" };
+
+/// Settings as JSON.
+let encode : Settings -> json.Value;
+let encode s = %{
+    "scheme" => Settings.scheme s, "theme" => atom_text (Settings.theme s), "accent" => Settings.accent s, "font_size" => Settings.font_size s,
+    "font" => Settings.font s, "line_height" => Settings.line_height s, "cursor" => atom_text (Settings.cursor s),
+    "shell" => Settings.shell s, "scrollback" => Settings.scrollback s, "copy_on_select" => Settings.copy_on_select s,
+    "bell" => Settings.bell s, "confirm_close" => Settings.confirm_close s, "integration" => Settings.integration s,
+    "autosuggest" => Settings.autosuggest s, "predictions" => Settings.predictions s, "risk_guard" => Settings.risk_guard s,
+    "explain" => Settings.explain s, "train" => Settings.train s, "assistant_open" => Settings.assistant_open s,
+    "animations" => Settings.animations s, "anim_running" => Settings.anim_running s, "anim_success" => Settings.anim_success s,
+    "anim_failure" => Settings.anim_failure s, "anim_long" => Settings.anim_long s, "anim_bell" => Settings.anim_bell s,
+    "custom_css" => Settings.custom_css s,
+    "keys" => Settings.keys s,
+};
+
+/// The string-to-string pairs of what should be a map of them.
+priv let string_map : :any -> %{:string => :string};
+priv let string_map m = if type_of m != :map { %{} } else {
+    map.from_pairs (list.filter (fn p -> type_of (list.head p) == :string && type_of (list.nth 1 p) == :string) (map.pairs m))
+};
+
+/// Settings from JSON, each field that is missing or of the wrong type at its default.
+let decode : json.Value -> Settings;
+let decode v = if type_of v != :map { Settings.new () } else {
+    let d = Settings.new ();
+    let str_of = fn k default -> match v.[k else ()] { x => if type_of x == :string { x } else { default } };
+    let int_of = fn k default lo hi -> match v.[k else ()] { x => if type_of x == :integer && x >= lo && x <= hi { x } else { default } };
+    let bool_of = fn k default -> match v.[k else ()] { x => if type_of x == :bool { x } else { default } };
+    let num_of = fn k default -> match v.[k else ()] { x => if type_of x == :float && x >= 1.0 && x <= 3.0 { x } else if type_of x == :integer && x >= 1 && x <= 3 { x + 0.0 } else { default } };
+    let keymap = string_map (v.["keys" else ()]);
+    d |> Settings.set_scheme (str_of "scheme" (Settings.scheme d))
+      |> Settings.set_theme (atom_of [:dark, :light, :auto] :auto (str_of "theme" "auto"))
+      |> Settings.set_accent (str_of "accent" (Settings.accent d))
+      |> Settings.set_font_size (int_of "font_size" 14 8 40)
+      |> Settings.set_font (str_of "font" "")
+      |> Settings.set_line_height (num_of "line_height" 1.3)
+      |> Settings.set_cursor (atom_of [:block, :bar, :underline] :block (str_of "cursor" "block"))
+      |> Settings.set_shell (str_of "shell" "")
+      |> Settings.set_scrollback (int_of "scrollback" 5000 100 100000)
+      |> Settings.set_copy_on_select (bool_of "copy_on_select" false)
+      |> Settings.set_bell (bool_of "bell" true)
+      |> Settings.set_confirm_close (bool_of "confirm_close" true)
+      |> Settings.set_integration (bool_of "integration" true)
+      |> Settings.set_autosuggest (bool_of "autosuggest" true)
+      |> Settings.set_predictions (bool_of "predictions" true)
+      |> Settings.set_risk_guard (bool_of "risk_guard" true)
+      |> Settings.set_explain (bool_of "explain" true)
+      |> Settings.set_train (bool_of "train" true)
+      |> Settings.set_assistant_open (bool_of "assistant_open" true)
+      |> Settings.set_animations (bool_of "animations" true)
+      |> Settings.set_anim_running (str_of "anim_running" "cat") |> Settings.set_anim_success (str_of "anim_success" "sparkle")
+      |> Settings.set_anim_failure (str_of "anim_failure" "shake") |> Settings.set_anim_long (str_of "anim_long" "confetti")
+      |> Settings.set_anim_bell (str_of "anim_bell" "ripple") |> Settings.set_custom_css (str_of "custom_css" "")
+      |> Settings.set_keys keymap
+};
+
+when test {
+    import std.test;
+    let tests = [
+        test.case "settings survive JSON" $({
+            let s = Settings.new () |> Settings.set_theme :light |> Settings.set_scheme "nord" |> Settings.set_font_size 16 |> Settings.set_keys %{"palette" => "Ctrl+K"};
+            test.eq! s (decode (encode s))
+        }),
+        test.case "a bad field is its default" $(test.eq! [14, :auto, true]
+            [Settings.font_size (decode %{"font_size" => 500}), Settings.theme (decode %{"theme" => "plaid"}), Settings.bell (decode %{"bell" => 3})]),
+        test.case "a chord finds its action, the person's own first" $({
+            let s = Settings.new () |> Settings.set_keys %{"queue_command" => "alt+q"};
+            test.eq! ["queue_command", "", "new_terminal"] [action_for s "Alt+Q", action_for s "Ctrl+Shift+Q", action_for s "Ctrl+Shift+T"]
+        }),
+    ];
+}

@@ -1,0 +1,199 @@
+// A database tab: connect to SQLite or PostgreSQL, browse the tables and
+// their columns, write SQL and see what it returns.
+//
+// Ctrl+Enter, anywhere in the tab, runs the editor's SQL; clicking a table
+// writes a query for its first rows and runs it. Every query run is kept,
+// newest first, to be run again. Results show at most the row limit, and say
+// when there were more.
+import std.graphics as ui;
+import std.graphics.browser;
+import std.graphics.html;
+import std.graphics.widgets as w;
+import std.list;
+import std.map;
+import std.num;
+import std.str;
+import ui_common;
+
+mapping Model {
+    id : :string = ""
+    kind : :string = "sqlite"
+    target : :string = ""
+    connected : :bool = false
+    connecting : :bool = false
+    error : :string = ""
+    schema : [:any] = []
+    open_tables : %{:string => :bool} = %{}
+    sql : :string = ""
+    limit : :integer = 500
+    running : :bool = false
+    asked : :integer = 0
+    result : :any = ()
+    history : [:string] = []
+}
+
+union Msg {
+    kind(k : :string)
+    target(t : :string)
+    connect
+    disconnect
+    refresh
+    toggle(table : :string)
+    preview(table : :string)
+    sql(s : :string)
+    limit(s : :string)
+    run
+    recall(s : :string)
+    answered(v : :any)
+}
+
+let new : :string -> Model;
+let new id = Model.new () |> Model.set_id id;
+
+let title : Model -> :string;
+let title m = if not (Model.connected m) { "Database" } else {
+    let t = Model.target m;
+    let short = list.last (str.split "/" (match str.split_once "?" t { () => t, [a, _] => a }));
+    ui_common.clip 24 (if short == "" { t } else { short })
+};
+
+priv let quote_ident name = "\"" + str.replace "\"" "\"\"" name + "\"";
+priv let quote_table kind name = if kind == "postgres" && str.contains_str "." name {
+    str.join_str "." (list.map quote_ident (str.split "." name)) } else { quote_ident name };
+
+priv let run_sql! m text = {
+    let n = Model.asked m + 1;
+    browser.invoke! "db_query" %{ "tab" => Model.id m, "request" => to_string n, "sql" => text, "limit" => Model.limit m } (fn r -> ())
+    m |> Model.set_running true |> Model.set_asked n |> Model.set_error ""
+      |> Model.set_history (list.take 50 (list.cons text (list.filter (fn h -> h != text) (Model.history m))))
+};
+
+let update! : (Msg -> :any) -> Msg -> Model -> Model;
+let update! wrap msg m = match msg {
+    Msg.kind(k) => Model.set_kind k m,
+    Msg.target(t) => Model.set_target t m,
+    Msg.connect => if str.trim (Model.target m) == "" { Model.set_error "Say which database: a file for SQLite, a URL for PostgreSQL." m } else {
+        browser.invoke! "db_open" %{ "tab" => Model.id m, "kind" => Model.kind m, "target" => str.trim (Model.target m) } (fn r -> ())
+        m |> Model.set_connecting true |> Model.set_error ""
+    },
+    Msg.disconnect => {
+        browser.invoke! "db_close" %{ "tab" => Model.id m } (fn r -> ())
+        m |> Model.set_connected false |> Model.set_schema [] |> Model.set_result ()
+    },
+    Msg.refresh => { browser.invoke! "db_schema" %{ "tab" => Model.id m } (fn r -> ()); m },
+    Msg.toggle(t) => Model.set_open_tables ((Model.open_tables m).[t => not ((Model.open_tables m).[t else false])]) m,
+    Msg.preview(t) => {
+        let text = "SELECT * FROM " + quote_table (Model.kind m) t + " LIMIT 100";
+        run_sql! (Model.set_sql text m) text
+    },
+    Msg.sql(s) => Model.set_sql s m,
+    Msg.limit(s) => match num.parse_int s { () => m, n => Model.set_limit n m },
+    Msg.run => if not (Model.connected m) || str.trim (Model.sql m) == "" { m } else { run_sql! m (Model.sql m) },
+    Msg.recall(s) => Model.set_sql s m,
+    Msg.answered(v) => match v.["op" else ""] {
+        "open" => if v.["ok" else false] {
+            m |> Model.set_connecting false |> Model.set_connected true |> Model.set_schema (v.["schema" else []])
+              |> Model.set_sql (if Model.sql m == "" { starter (v.["schema" else []]) (Model.kind m) } else { Model.sql m })
+        } else { m |> Model.set_connecting false |> Model.set_error (v.["error" else "could not connect"]) },
+        "schema" => if v.["ok" else false] { Model.set_schema (v.["schema" else []]) m } else { Model.set_error (v.["error" else ""]) m },
+        "query" => if v.["request" else ""] != to_string (Model.asked m) { m }
+            else if v.["ok" else false] {
+                let r = v.["result"];
+                let changed = r.["columns" else []] == [] && r.["changes" else 0] > 0;
+                if changed { browser.invoke! "db_schema" %{ "tab" => Model.id m } (fn x -> ()) }
+                m |> Model.set_running false |> Model.set_result r
+            } else { m |> Model.set_running false |> Model.set_result () |> Model.set_error (v.["error" else "the query failed"]) },
+        _ => m,
+    },
+};
+
+/// A first query to show: the first table's rows, or a reminder of what to type.
+priv let starter schema kind = match schema {
+    [] => "-- No tables yet.\nCREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);",
+    _ => "SELECT * FROM " + quote_table kind ((list.head schema).["name"]) + " LIMIT 100",
+};
+
+priv let schema_view wrap m = w.column (list.map (fn t -> {
+    let name = t.["name"];
+    let opened = (Model.open_tables m).[name else false];
+    w.column [
+        w.row [
+            w.icon_button (if opened { "chevron-down" } else { "chevron-right" }) "Columns" (wrap (Msg.toggle name)) |> w.ghost |> w.small,
+            w.nav_item (if t.["kind" else "table"] == "view" { "layers" } else { "table" }) name false (wrap (Msg.preview name)) |> w.grow,
+        ] |> w.gap 0,
+        if not opened { ui.nothing } else {
+            w.column (list.map (fn c -> w.row [
+                if c.["key" else false] { w.icon "key" } else { w.icon "minus" },
+                w.code c.["name"], w.spacer, w.caption c.["type"],
+            ] |> w.gap 2 |> ui.keyed ("c" + c.["name"])) (t.["columns" else []])) |> w.gap 1 |> w.padding 2
+        },
+    ] |> w.gap 0 |> ui.keyed ("t" + name)
+}) (Model.schema m)) |> w.gap 0;
+
+priv let result_view m = match Model.result m {
+    () => if Model.running m { w.center [w.spinner, w.caption "Running…"] }
+          else if Model.connected m { w.empty "No results yet" "Write SQL above and press Ctrl+Enter." } else { ui.nothing },
+    r => {
+        let columns = r.["columns" else []];
+        w.column [
+            w.row [
+                w.badge (if columns == [] { to_string (r.["changes" else 0]) + " changed" } else { to_string (r.["total" else 0]) + " rows" }) |> w.tone :success,
+                w.caption (ui_common.duration (r.["ms" else 0])),
+                if r.["statements" else 1] > 1 { w.caption (to_string r.["statements"] + " statements") } else { ui.nothing },
+                if r.["truncated" else false] { w.badge ("showing " + to_string (len r.["rows"])) |> w.tone :warning } else { ui.nothing },
+            ],
+            if columns == [] { ui.nothing } else {
+                w.table columns (list.map (fn row -> list.map (fn v -> if v == () { w.caption "null" } else { w.code (ui_common.clip 200 v) }) row) (r.["rows" else []]))
+                    |> w.mono
+            },
+        ]
+    },
+};
+
+let view : (Msg -> :any) -> Model -> ui.Node;
+let view wrap m = w.workspace [
+    w.sidebar [
+        w.heading "Connection",
+        w.tabs [["sqlite", "SQLite"], ["postgres", "PostgreSQL"]] (Model.kind m) (fn k -> wrap (Msg.kind k)),
+        w.text_field (if Model.kind m == "sqlite" { "File" } else { "URL" }) (Model.target m) (fn t -> wrap (Msg.target t))
+            |> w.placeholder (if Model.kind m == "sqlite" { "~/notes.db or :memory:" } else { "postgres://user@localhost/db" })
+            |> w.on_enter (wrap Msg.connect) |> w.mono |> w.autofocus,
+        w.row [
+            if Model.connected m { w.button "Disconnect" (wrap Msg.disconnect) |> w.small }
+            else { w.button (if Model.connecting m { "Connecting…" } else { "Connect" }) (wrap Msg.connect) |> w.primary |> w.small |> w.disabled (Model.connecting m) },
+            if Model.connected m { w.icon_button "refresh" "Reload schema" (wrap Msg.refresh) |> w.ghost |> w.small } else { ui.nothing },
+        ],
+        if Model.error m == "" { ui.nothing } else { w.notice :danger (Model.error m) },
+        if Model.connected m { w.section "Tables" [schema_view wrap m] } else { ui.nothing },
+        if Model.history m == [] { ui.nothing } else {
+            w.section "Recent" [w.column (list.map_indexed (fn i s -> w.nav_item "history" (ui_common.clip 40 s) false (wrap (Msg.recall s))
+                |> w.tooltip s |> ui.keyed ("q" + to_string i)) (list.take 12 (Model.history m))) |> w.gap 0]
+        },
+    ] |> w.width "18rem",
+    w.panel [
+        w.row [
+            w.button_with "play" (if Model.running m { "Running…" } else { "Run" }) (wrap Msg.run) |> w.primary |> w.small
+                |> w.disabled (not (Model.connected m) || Model.running m),
+            w.kbd "Ctrl+Enter",
+            w.spacer,
+            w.select "Rows" ["100", "500", "1000", "5000"] (to_string (Model.limit m)) (fn s -> wrap (Msg.limit s)) |> w.quiet_label |> w.width "7rem",
+        ],
+        ui.element "textarea" [html.class "dw-control dw-mono sl-sql", html.value (Model.sql m), html.attr "rows" 8,
+            html.attr "spellcheck" "false", html.aria "label" "SQL", html.attr "placeholder" "SELECT …",
+            html.on_input (fn s -> wrap (Msg.sql s)),
+            html.prevent_keys ["ctrl+enter", "meta+enter"]] [],
+        result_view m,
+    ] |> w.padding 4 |> w.gap 3,
+];
+
+when test {
+    import std.test;
+    let tests = [
+        test.case "a table's name is quoted" $(test.eq! "\"my \"\"t\"\"\"" (quote_table "sqlite" "my \"t\"")),
+        test.case "a schema-qualified PostgreSQL name is quoted in parts" $(test.eq! "\"audit\".\"log\"" (quote_table "postgres" "audit.log")),
+        test.case "an answer to an older query is ignored" $({
+            let m = new "d" |> Model.set_asked 2 |> Model.set_running true;
+            test.true! (Model.running (update! (fn x -> x) (Msg.answered %{ "op" => "query", "request" => "1", "ok" => true, "result" => %{} }) m))
+        }),
+    ];
+}

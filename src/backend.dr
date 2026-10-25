@@ -1,0 +1,177 @@
+// sleep's backend: the native process behind the window, with the machine
+// the frontend has no way to reach -- shells on pseudo-terminals, the
+// network, databases, files -- offered as a table of commands and nothing
+// else (`std.graphics.backend`).
+//
+// **Nothing slow is answered in line.** The backend answers one request at a
+// time, in order, which is what keeps keystrokes in order; so whatever could
+// take a while -- an HTTP request, a query, opening a database, the insights
+// -- is started in a process of its own, answered at once with `true`, and
+// its result sent later as an event (`http`, `db`, `insights`). A terminal's
+// output arrives the same way (`screen`), from its session.
+//
+// **What is running is found by name**: each terminal's session and each
+// database tab's connection is registered under the tab's id
+// (`std.registry`), and dropped from it when it ends.
+import std.error;
+import std.file;
+import std.graphics.backend;
+import std.json;
+import std.list;
+import std.map;
+import std.num;
+import std.os;
+import std.path;
+import std.proc;
+import std.registry;
+import std.str;
+import std.vm;
+import assist;
+import databases;
+import requests;
+import session;
+import settings.{Settings};
+import settings;
+
+/// Where settings are kept: `$XDG_CONFIG_HOME/sleep`, or `~/.config/sleep`.
+priv let config_file! u = {
+    let home = match path.home! () { () => "/tmp", h => h };
+    let base = match os.env! "XDG_CONFIG_HOME" { () => path.join home ".config", "" => path.join home ".config", d => d };
+    path.join (path.join base "sleep") "settings.json"
+};
+
+priv let load_settings! u = match file.read! (config_file! ()) {
+    () => Settings.new (),
+    text => match json.decode text { Result.ok(v) => settings.decode v, Result.error(_) => Settings.new () },
+};
+
+priv let save_settings! s = {
+    let p = config_file! ();
+    file.mkdir_all! (file.parent p)
+    file.write! p (json.pretty (settings.encode s))
+    true
+};
+
+priv let field v k d = match v.[k else ()] { x => if x == () { d } else { x } };
+priv let text_field v k = match v.[k else ""] { x => if type_of x == :string { x } else { "" } };
+priv let int_field v k d lo hi = match v.[k else d] { x => if type_of x == :integer { num.clamp lo hi x } else { d } };
+
+/// Run `work!` in a process of its own, and answer at once.
+priv let later! work! = { spawn! $( { work! (); () } ); true };
+
+/// The command table, made with the events it reports through.
+let commands! : :any -> %{:string => backend.Command};
+let commands! events = {
+    let reg = registry.start! ();
+    let current = load_settings! ();
+    let helper = assist.start! events (Settings.train current);
+    let session_of! = fn id -> registry.whereis! reg ("term:" + id);
+    let db_of! = fn tab -> registry.whereis! reg ("db:" + tab);
+    let tell! = fn id msg -> match session_of! id { () => false, pid => { send! pid msg; true } };
+    %{
+        "settings_load" => backend.command! :any :any (fn v -> settings.encode (load_settings! ())),
+        "settings_save" => backend.command! :any :bool (fn v -> {
+            let s = settings.decode v;
+            send! helper [:settings, Settings.train s]
+            list.each! (fn name -> match registry.whereis! reg name { () => (), pid => send! pid [:settings, Settings.autosuggest s, Settings.risk_guard s] })
+                (list.filter (fn n -> str.starts_with "term:" n) (registry.names! reg))
+            save_settings! s
+        }),
+
+        "term_open" => backend.command! :any :any (fn v -> {
+            let s = load_settings! ();
+            let id = "t" + to_string (vm.unique! ());
+            let opts = session.Start.new () |> session.Start.set_id id
+                |> session.Start.set_cols (int_field v "cols" 80 2 1000) |> session.Start.set_rows (int_field v "rows" 24 1 500)
+                |> session.Start.set_cwd (text_field v "cwd") |> session.Start.set_shell (Settings.shell s)
+                |> session.Start.set_integration (Settings.integration s) |> session.Start.set_scrollback (Settings.scrollback s)
+                |> session.Start.set_autosuggest (Settings.autosuggest s) |> session.Start.set_risk_guard (Settings.risk_guard s);
+            let pid = session.start! opts events helper;
+            registry.register! reg ("term:" + id) pid
+            %{ "id" => id }
+        }),
+        "term_input" => backend.command! :any :bool (fn v -> tell! (text_field v "id") [:write, text_field v "data", field v "force" false == true]),
+        "term_resize" => backend.command! :any :bool (fn v ->
+            tell! (text_field v "id") [:resize, int_field v "cols" 80 2 1000, int_field v "rows" 24 1 500]),
+        "term_close" => backend.command! :any :bool (fn v -> tell! (text_field v "id") [:close]),
+        "term_signal" => backend.command! :any :bool (fn v -> {
+            let sig = match text_field v "signal" { "interrupt" => :interrupt, "terminate" => :terminate, "kill" => :kill, "hangup" => :hangup, _ => :interrupt };
+            tell! (text_field v "id") [:signal, sig]
+        }),
+        "term_queue" => backend.command! :any :bool (fn v -> if str.trim (text_field v "command") == "" { false }
+            else { tell! (text_field v "id") [:queue, str.trim (text_field v "command")] }),
+        "term_unqueue" => backend.command! :any :bool (fn v -> tell! (text_field v "id") [:unqueue, int_field v "index" 0 0 1000]),
+        "term_allow" => backend.command! :any :bool (fn v -> tell! (text_field v "id") [:allow, text_field v "command"]),
+        "term_text" => backend.command! :any :string (fn v -> match session_of! (text_field v "id") {
+            () => "",
+            pid => {
+                send! pid [:text, int_field v "from" 0 0 1000000000, int_field v "to" 0 0 1000000000, self! ()]
+                match proc.recv_where_within! (fn m -> match m { [:text, _] => true, _ => false }) 3000 {
+                    Result.ok([:text, t]) => t,
+                    _ => "",
+                }
+            },
+        }),
+
+        "assist_ask" => backend.command! :any :any (fn v -> proc.call! helper [:ask, text_field v "question"]),
+        "assist_history" => backend.command! :any :any (fn v -> proc.call! helper [:history, text_field v "query"]),
+        "assist_predict" => backend.command! :any :any (fn v ->
+            proc.call! helper [:predict, list.filter (fn c -> type_of c == :string) (field v "recent" []), text_field v "cwd"]),
+        "assist_expected" => backend.command! :any :integer (fn v -> proc.call! helper [:expected, text_field v "command"]),
+        "assist_model" => backend.command! :any :any (fn v -> proc.call! helper [:model]),
+        "assist_insights" => backend.command! :any :bool (fn v -> later! (fn u -> {
+            let me = self! ();
+            send! helper [:insights, me]
+            match proc.recv_where_within! (fn m -> match m { [:insights, _] => true, _ => false }) 120000 {
+                Result.ok([:insights, value]) => backend.emit! events "insights" value,
+                _ => backend.emit! events "insights" %{ "error" => "the insights took too long" },
+            }
+        })),
+
+        "http_send" => backend.command! :any :bool (fn v -> later! (fn u -> {
+            let result = requests.send! (requests.ask_of v);
+            backend.emit! events "http" %{ "tab" => text_field v "tab", "request" => text_field v "request", "result" => result }
+        })),
+
+        "db_open" => backend.command! :any :bool (fn v -> later! (fn u -> {
+            let tab = text_field v "tab";
+            match db_of! tab { () => (), old => databases.close! old }
+            let kind = if text_field v "kind" == "postgres" { :postgres } else { :sqlite };
+            match try! { Result.ok (databases.open! kind (text_field v "target")) } catch e { Result.error (error.message e) } {
+                Result.ok(db) => {
+                    registry.register! reg ("db:" + tab) db
+                    backend.emit! events "db" %{ "tab" => tab, "op" => "open", "ok" => true,
+                        "schema" => Result.unwrap_or [] (databases.schema_of! db) }
+                },
+                Result.error(why) => backend.emit! events "db" %{ "tab" => tab, "op" => "open", "ok" => false, "error" => why },
+            }
+        })),
+        "db_schema" => backend.command! :any :bool (fn v -> later! (fn u -> {
+            let tab = text_field v "tab";
+            match db_of! tab {
+                () => backend.emit! events "db" %{ "tab" => tab, "op" => "schema", "ok" => false, "error" => "not connected" },
+                db => match databases.schema_of! db {
+                    Result.ok(s) => backend.emit! events "db" %{ "tab" => tab, "op" => "schema", "ok" => true, "schema" => s },
+                    Result.error(why) => backend.emit! events "db" %{ "tab" => tab, "op" => "schema", "ok" => false, "error" => why },
+                },
+            }
+        })),
+        "db_query" => backend.command! :any :bool (fn v -> later! (fn u -> {
+            let tab = text_field v "tab";
+            let request = text_field v "request";
+            match db_of! tab {
+                () => backend.emit! events "db" %{ "tab" => tab, "request" => request, "op" => "query", "ok" => false, "error" => "not connected" },
+                db => match databases.run! db (text_field v "sql") (int_field v "limit" 500 1 100000) {
+                    Result.ok(r) => backend.emit! events "db" %{ "tab" => tab, "request" => request, "op" => "query", "ok" => true, "result" => r },
+                    Result.error(why) => backend.emit! events "db" %{ "tab" => tab, "request" => request, "op" => "query", "ok" => false, "error" => why },
+                },
+            }
+        })),
+        "db_close" => backend.command! :any :bool (fn v -> match db_of! (text_field v "tab") {
+            () => false,
+            db => { databases.close! db; true },
+        }),
+    }
+};
+
+let main! = backend.serve_with! commands!;

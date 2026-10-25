@@ -1,0 +1,310 @@
+// A request tab: compose an HTTP request, send it, and look at what came
+// back -- status, headers, body, and every redirect on the way.
+//
+// The tab is its own small program (a model, its messages, `update!` and
+// `view`), which the window runs for each request tab it has; whatever it
+// asks of the backend comes back to it through `wrap`, the window's way of
+// addressing a message to this tab.
+import std.graphics as ui;
+import std.graphics.browser;
+import std.graphics.html;
+import std.graphics.widgets as w;
+import std.http.url;
+import std.json;
+import std.list;
+import std.num;
+import std.str;
+import ui_common;
+
+/// A header, query parameter or form field being edited: on or off.
+struct Pair {
+    name : :string
+    value : :string
+    on : :bool
+}
+
+mapping Model {
+    id : :string = ""
+    method : :string = "GET"
+    url : :string = ""
+    params : [Pair] = []
+    headers : [Pair] = [Pair.make "Accept" "*/*" true, Pair.make "User-Agent" "sleep/0.1" true]
+    body_kind : :string = "none"
+    body : :string = ""
+    auth : :string = "none"
+    token : :string = ""
+    user : :string = ""
+    password : :string = ""
+    follow : :bool = true
+    timeout : :integer = 30
+    insecure : :bool = false
+    section : :string = "params"
+    view : :string = "body"
+    sending : :bool = false
+    sent : :integer = 0
+    response : :any = ()
+    history : [[:any]] = []
+}
+
+union Msg {
+    method(m : :string)
+    url(u : :string)
+    section(s : :string)
+    view(v : :string)
+    add_pair(which : :string)
+    pair_name(which : :string, i : :integer, s : :string)
+    pair_value(which : :string, i : :integer, s : :string)
+    pair_on(which : :string, i : :integer, b : :bool)
+    pair_remove(which : :string, i : :integer)
+    body_kind(k : :string)
+    body(s : :string)
+    beautify
+    auth(a : :string)
+    token(s : :string)
+    user(s : :string)
+    password(s : :string)
+    follow(b : :bool)
+    timeout(n : :any)
+    insecure(b : :bool)
+    send
+    copy_curl
+    copy_body
+    recall(i : :integer)
+    answered(v : :any)
+}
+
+/// A new tab, aimed at `u`.
+let new : :string -> :string -> Model;
+let new id u = Model.new () |> Model.set_id id |> Model.set_url u;
+
+/// The tab's title: the request, briefly.
+let title : Model -> :string;
+let title m = if Model.url m == "" { "New request" } else {
+    let u = str.trim_prefix "https://" (str.trim_prefix "http://" (Model.url m));
+    Model.method m + " " + (if str.length u > 28 { str.of_chars (list.take 28 (str.chars u)) + "…" } else { u })
+};
+
+priv let pairs_of which m = match which { "params" => Model.params m, "form" => form_pairs m, _ => Model.headers m };
+priv let set_pairs which ps m = match which {
+    "params" => Model.set_url (with_params (Model.url m) ps) (Model.set_params ps m),
+    "form" => Model.set_body (encode_form ps) m,
+    _ => Model.set_headers ps m,
+};
+
+/// The URL without its query, and with `ps` as its query.
+priv let with_params u ps = {
+    let base = match str.split_once "?" u { () => u, [b, _] => b };
+    let on = list.filter Pair.on ps;
+    if on == [] { base } else { base + "?" + str.join_str "&" (list.map (fn p -> url.encode_form (Pair.name p) + "=" + url.encode_form (Pair.value p)) on) }
+};
+/// A URL's query as pairs to edit.
+priv let params_of u = match str.split_once "?" u {
+    () => [],
+    [_, q] => list.map (fn kv -> Pair.make (list.head kv) (list.nth 1 kv) true) (url.decode_query q),
+};
+priv let form_pairs m = list.map (fn kv -> Pair.make (list.head kv) (list.nth 1 kv) true) (url.decode_query (Model.body m));
+priv let encode_form ps = str.join_str "&" (list.map (fn p -> url.encode_form (Pair.name p) + "=" + url.encode_form (Pair.value p)) (list.filter Pair.on ps));
+
+priv let update_at i f xs = list.map_indexed (fn j x -> if j == i { f x } else { x }) xs;
+priv let remove_at i xs = list.flat_map (fn p -> if list.head p == i { [] } else { [list.nth 1 p] }) (list.enumerate xs);
+
+/// The headers sent: the enabled ones, the body's type, and the auth.
+priv let headers_sent m = {
+    let own = list.map (fn p -> [Pair.name p, Pair.value p]) (list.filter (fn p -> Pair.on p && str.trim (Pair.name p) != "") (Model.headers m));
+    let named = fn n -> list.any (fn h -> str.lower (list.head h) == n) own;
+    let typed = match Model.body_kind m {
+        "json" => if named "content-type" { [] } else { [["Content-Type", "application/json"]] },
+        "form" => if named "content-type" { [] } else { [["Content-Type", "application/x-www-form-urlencoded"]] },
+        "text" => if named "content-type" { [] } else { [["Content-Type", "text/plain; charset=utf-8"]] },
+        _ => [],
+    };
+    let auth = match Model.auth m {
+        "bearer" => if Model.token m == "" { [] } else { [["Authorization", "Bearer " + Model.token m]] },
+        "basic" => [["Authorization", "Basic " + ui_common.base64 (Model.user m + ":" + Model.password m)]],
+        _ => [],
+    };
+    list.concat [own, typed, auth]
+};
+
+priv let body_sent m = if Model.body_kind m == "none" || Model.method m == "GET" || Model.method m == "HEAD" { "" } else { Model.body m };
+
+/// The request as a `curl` command line, quoted for a POSIX shell.
+let curl : Model -> :string;
+let curl m = {
+    let q = fn s -> "'" + str.replace "'" "'\\''" s + "'";
+    let parts = list.concat [
+        ["curl", "-i"],
+        if Model.method m == "GET" { [] } else { ["-X", Model.method m] },
+        if Model.follow m { ["-L"] } else { [] },
+        if Model.insecure m { ["-k"] } else { [] },
+        list.flat_map (fn h -> ["-H", q (list.head h + ": " + list.nth 1 h)]) (headers_sent m),
+        if body_sent m == "" { [] } else { ["--data-raw", q (body_sent m)] },
+        [q (Model.url m)],
+    ];
+    str.join_str " " parts
+};
+
+let update! : (Msg -> :any) -> Msg -> Model -> Model;
+let update! wrap msg m = match msg {
+    Msg.method(x) => Model.set_method x m,
+    Msg.url(u) => m |> Model.set_url u |> Model.set_params (params_of u),
+    Msg.section(s) => Model.set_section s m,
+    Msg.view(v) => Model.set_view v m,
+    Msg.add_pair(which) => set_pairs which (list.append (pairs_of which m) [Pair.make "" "" true]) m,
+    Msg.pair_name(which, i, s) => set_pairs which (update_at i (fn p -> Pair.make s (Pair.value p) (Pair.on p)) (pairs_of which m)) m,
+    Msg.pair_value(which, i, s) => set_pairs which (update_at i (fn p -> Pair.make (Pair.name p) s (Pair.on p)) (pairs_of which m)) m,
+    Msg.pair_on(which, i, b) => set_pairs which (update_at i (fn p -> Pair.make (Pair.name p) (Pair.value p) b) (pairs_of which m)) m,
+    Msg.pair_remove(which, i) => set_pairs which (remove_at i (pairs_of which m)) m,
+    Msg.body_kind(k) => Model.set_body_kind k m,
+    Msg.body(s) => Model.set_body s m,
+    Msg.beautify => match json.decode (Model.body m) { Result.ok(v) => Model.set_body (json.pretty v) m, Result.error(_) => m },
+    Msg.auth(a) => Model.set_auth a m,
+    Msg.token(s) => Model.set_token s m,
+    Msg.user(s) => Model.set_user s m,
+    Msg.password(s) => Model.set_password s m,
+    Msg.follow(b) => Model.set_follow b m,
+    Msg.timeout(n) => if type_of n == :integer && n > 0 { Model.set_timeout n m } else { m },
+    Msg.insecure(b) => Model.set_insecure b m,
+    Msg.send => if str.trim (Model.url m) == "" { m } else {
+        let n = Model.sent m + 1;
+        browser.invoke! "http_send" %{
+            "tab" => Model.id m, "request" => to_string n, "method" => Model.method m, "url" => Model.url m,
+            "headers" => headers_sent m, "body" => body_sent m, "timeout_ms" => Model.timeout m * 1000,
+            "follow" => Model.follow m, "insecure" => Model.insecure m,
+        } (fn r -> ())
+        m |> Model.set_sending true |> Model.set_sent n
+    },
+    Msg.copy_curl => { browser.copy! (curl m); m },
+    Msg.copy_body => match Model.response m { () => m, r => { browser.copy! (if r.["pretty" else ""] != "" { r.["pretty"] } else { r.["body" else ""] }); m } },
+    Msg.recall(i) => match list.nth i (Model.history m) {
+        [method, u, _, _] => m |> Model.set_method method |> Model.set_url u |> Model.set_params (params_of u),
+        _ => m,
+    },
+    Msg.answered(v) => {
+        let r = v.["result" else %{}];
+        let entry = [Model.method m, Model.url m, r.["status" else 0], r.["ms" else 0]];
+        m |> Model.set_sending false |> Model.set_response r |> Model.set_view (if r.["ok" else false] { Model.view m } else { "timeline" })
+          |> Model.set_history (list.take 30 (list.cons entry (list.filter (fn h -> list.take 2 h != list.take 2 entry) (Model.history m))))
+    },
+};
+
+// --- the view ------------------------------------------------------------------------
+
+priv let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+
+priv let pairs_editor wrap which ps = w.column (list.append (list.map_indexed (fn i p -> w.row [
+    w.checkbox "" (Pair.on p) (fn b -> wrap (Msg.pair_on which i b)),
+    w.text_field "Name" (Pair.name p) (fn s -> wrap (Msg.pair_name which i s)) |> w.quiet_label |> w.placeholder "Name" |> w.grow |> w.mono,
+    w.text_field "Value" (Pair.value p) (fn s -> wrap (Msg.pair_value which i s)) |> w.quiet_label |> w.placeholder "Value" |> w.grow |> w.mono,
+    w.icon_button "trash" "Remove" (wrap (Msg.pair_remove which i)) |> w.ghost |> w.small,
+] |> w.gap 2 |> ui.keyed (which + to_string i)) ps) [w.row [w.button_with "plus" "Add" (wrap (Msg.add_pair which)) |> w.ghost |> w.small]]) |> w.gap 1;
+
+priv let editor wrap m = match Model.section m {
+    "params" => pairs_editor wrap "params" (Model.params m),
+    "headers" => pairs_editor wrap "headers" (Model.headers m),
+    "body" => w.column [
+        w.row [w.tabs [["none", "None"], ["json", "JSON"], ["text", "Text"], ["form", "Form"]] (Model.body_kind m) (fn k -> wrap (Msg.body_kind k)),
+               w.spacer, if Model.body_kind m == "json" { w.button "Beautify" (wrap Msg.beautify) |> w.ghost |> w.small } else { ui.nothing }],
+        match Model.body_kind m {
+            "none" => w.caption "This request has no body.",
+            "form" => pairs_editor wrap "form" (form_pairs m),
+            _ => w.text_area "Body" (Model.body m) (fn s -> wrap (Msg.body s)) |> w.quiet_label |> w.mono |> w.prevent_keys ["ctrl+enter", "meta+enter"]
+                |> w.placeholder (if Model.body_kind m == "json" { "{\n  \"name\": \"value\"\n}" } else { "" }),
+        },
+    ],
+    "auth" => w.column [
+        w.tabs [["none", "None"], ["bearer", "Bearer token"], ["basic", "Basic"]] (Model.auth m) (fn a -> wrap (Msg.auth a)),
+        match Model.auth m {
+            "bearer" => w.password_field "Token" (Model.token m) (fn s -> wrap (Msg.token s)) |> w.mono,
+            "basic" => w.grid 2 [w.text_field "User" (Model.user m) (fn s -> wrap (Msg.user s)),
+                                 w.password_field "Password" (Model.password m) (fn s -> wrap (Msg.password s))],
+            _ => w.caption "No credentials are sent.",
+        },
+    ],
+    _ => w.column [
+        w.switch "Follow redirects" (Model.follow m) (fn b -> wrap (Msg.follow b)),
+        w.switch "Skip certificate checks (insecure)" (Model.insecure m) (fn b -> wrap (Msg.insecure b)),
+        w.number_field "Timeout, seconds" (Model.timeout m) (fn n -> wrap (Msg.timeout n)) |> w.width "12rem",
+    ],
+};
+
+priv let status_tone s = if s >= 500 { :danger } else if s >= 400 { :warning } else if s >= 300 { :info } else { :success };
+
+priv let response_view wrap m = match Model.response m {
+    () => if Model.sending m { w.center [w.spinner, w.caption "Waiting for the server…"] }
+          else { w.empty "No response yet" "Send the request to see what comes back. Ctrl+Enter sends it." },
+    r => {
+        let ok = r.["ok" else false];
+        let hops = r.["hops" else []];
+        w.column [
+            w.row [
+                if ok { w.badge (to_string r.["status"] + " " + r.["reason" else ""]) |> w.tone (status_tone r.["status"]) }
+                else { w.badge ("Failed: " + r.["kind" else "error"]) |> w.tone :danger },
+                w.caption (ui_common.duration r.["ms" else 0]),
+                if ok { w.caption (ui_common.bytes r.["size" else 0]) } else { ui.nothing },
+                if len hops > 1 { w.caption (to_string (len hops - 1) + " redirect" + (if len hops == 2 { "" } else { "s" })) } else { ui.nothing },
+                w.spacer,
+                if Model.sending m { w.spinner } else { ui.nothing },
+                w.icon_button "copy" "Copy body" (wrap Msg.copy_body) |> w.ghost |> w.small,
+            ],
+            if not ok { w.notice :danger r.["error" else "The request failed."] } else { ui.nothing },
+            w.tabs [["body", "Body"], ["headers", "Headers (" + to_string (len r.["headers" else []]) + ")"], ["timeline", "Timeline"]]
+                (Model.view m) (fn v -> wrap (Msg.view v)),
+            match Model.view m {
+                "headers" => w.pairs (r.["headers" else []]),
+                "timeline" => w.column (list.map_indexed (fn i hop -> w.card [
+                    w.row [w.badge (to_string hop.["status"]) |> w.tone (status_tone hop.["status"]), w.code hop.["method"],
+                           w.text hop.["url"] |> w.grow, w.caption (ui_common.duration hop.["ms"])],
+                    w.pairs (list.filter (fn h -> list.contains (str.lower (list.head h)) ["location", "set-cookie", "content-type", "server", "cache-control"]) hop.["headers"]),
+                ] |> w.padding 3 |> ui.keyed ("hop" + to_string i)) hops) |> w.gap 2,
+                _ => if not ok { w.caption "" } else if r.["pretty" else ""] != "" { w.code_block r.["pretty"] }
+                     else if r.["body" else ""] == "" { w.caption "The response has no body." }
+                     else { w.code_block (r.["body"] + (if r.["truncated" else false] { "\n…" } else { "" })) },
+            },
+        ]
+    },
+};
+
+let view : (Msg -> :any) -> Model -> ui.Node;
+let view wrap m = w.workspace [
+    w.sidebar [
+        w.heading "History",
+        if Model.history m == [] { w.caption "Requests you send appear here." } else { ui.nothing },
+        w.column (list.map_indexed (fn i h -> {
+            let [method, u, status, ms] = h;
+            w.nav_item "send" (method + " " + str.trim_prefix "https://" (str.trim_prefix "http://" u)) false (wrap (Msg.recall i))
+                |> w.tooltip (u + "  ·  " + to_string status + "  ·  " + ui_common.duration ms) |> ui.keyed ("h" + to_string i)
+        }) (Model.history m)) |> w.gap 0,
+    ] |> w.width "15rem",
+    w.panel [
+        w.row [
+            w.select "Method" methods (Model.method m) (fn x -> wrap (Msg.method x)) |> w.quiet_label |> w.width "8rem",
+            w.text_field "URL" (Model.url m) (fn u -> wrap (Msg.url u)) |> w.quiet_label |> w.placeholder "https://api.example.com/users"
+                |> w.on_enter (wrap Msg.send) |> w.grow |> w.mono |> w.autofocus,
+            w.button_with "send" (if Model.sending m { "Sending…" } else { "Send" }) (wrap Msg.send) |> w.primary |> w.disabled (Model.sending m),
+            w.icon_button "code" "Copy as curl" (wrap Msg.copy_curl) |> w.ghost,
+        ] |> w.gap 2,
+        w.tabs [["params", "Params"], ["headers", "Headers"], ["body", "Body"], ["auth", "Auth"], ["options", "Options"]]
+            (Model.section m) (fn s -> wrap (Msg.section s)),
+        editor wrap m,
+        w.divider,
+        response_view wrap m,
+    ] |> w.padding 4 |> w.gap 3,
+];
+
+when test {
+    import std.test;
+    let tests = [
+        test.case "a query is edited as pairs, and the URL follows" $({
+            let m = new "r" "https://x.io/a?q=1&n=two";
+            let m2 = update! (fn x -> x) (Msg.pair_value "params" 1 "3") (update! (fn x -> x) (Msg.url "https://x.io/a?q=1&n=two") m);
+            test.eq! "https://x.io/a?q=1&n=3" (Model.url m2)
+        }),
+        test.case "curl says what would be sent" $({
+            let m = new "r" "https://x.io/u" |> Model.set_method "POST" |> Model.set_body_kind "json" |> Model.set_body "{\"a\":1}"
+                |> Model.set_headers [] |> Model.set_auth "bearer" |> Model.set_token "t0k";
+            test.eq! "curl -i -X POST -L -H 'Content-Type: application/json' -H 'Authorization: Bearer t0k' --data-raw '{\"a\":1}' 'https://x.io/u'" (curl m)
+        }),
+        test.case "a title is short" $(test.eq! "GET x.io/abcdefghijklmnopqrstuvw…" (title (new "r" "https://x.io/abcdefghijklmnopqrstuvwxyz0123"))),
+    ];
+}

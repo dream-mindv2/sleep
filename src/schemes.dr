@@ -1,0 +1,89 @@
+// Colour schemes: the sixteen colours of the terminal's palette, its
+// background, text, cursor and selection, the accent of the window around
+// it, and whether that window is light or dark.
+//
+// A scheme is applied as CSS custom properties on the window -- the
+// `--dw-ansi-*` and `--dw-term-*` variables `std.graphics.widgets`' terminal
+// draws with, and the kit's own `--dw-*` -- so changing it recolours every
+// line already on the screen at once, with nothing redrawn but the styles.
+import std.list;
+import std.map;
+
+/// A scheme. `ansi` is the 16 palette colours, black to bright white.
+mapping Scheme {
+    id : :string = ""
+    name : :string = ""
+    mode : :atom = :dark
+    background : :string = ""
+    foreground : :string = ""
+    cursor : :string = ""
+    selection : :string = ""
+    accent : :string = ""
+    ansi : [:string] = []
+}
+
+priv let s id name mode bg fg cursor selection accent ansi = Scheme.new () |> Scheme.set_id id |> Scheme.set_name name
+    |> Scheme.set_mode mode |> Scheme.set_background bg |> Scheme.set_foreground fg |> Scheme.set_cursor cursor
+    |> Scheme.set_selection selection |> Scheme.set_accent accent |> Scheme.set_ansi ansi;
+
+let all : [Scheme];
+let all = [
+    s "sleep-dark" "Sleep Dark" :dark "#0f0f14" "#dcdce6" "#a5a5ff" "rgb(165 165 255 / 0.25)" "#7c7cf0"
+        ["#1d1d24", "#ff6b72", "#7fd88f", "#f1c76b", "#79a6ff", "#d39cff", "#5fd3e0", "#c8c8d4",
+         "#5c5c6b", "#ff8a90", "#9ce6a9", "#ffd98a", "#9bbcff", "#e2b8ff", "#8ae4ee", "#f4f4fa"],
+    s "sleep-light" "Sleep Light" :light "#fcfcfd" "#24242c" "#5b5bd6" "rgb(91 91 214 / 0.22)" "#5b5bd6"
+        ["#2b2b33", "#c8323a", "#2f8a3e", "#a26b00", "#2f5fd0", "#9b3fbf", "#16808f", "#c9c9d2",
+         "#6a6a78", "#e0464e", "#38a34b", "#c08400", "#4a77e8", "#b356d6", "#1c9aab", "#fafafc"],
+    s "dracula" "Dracula" :dark "#282a36" "#f8f8f2" "#f8f8f2" "rgb(68 71 90 / 0.9)" "#bd93f9"
+        ["#21222c", "#ff5555", "#50fa7b", "#f1fa8c", "#bd93f9", "#ff79c6", "#8be9fd", "#f8f8f2",
+         "#6272a4", "#ff6e6e", "#69ff94", "#ffffa5", "#d6acff", "#ff92df", "#a4ffff", "#ffffff"],
+    s "nord" "Nord" :dark "#2e3440" "#d8dee9" "#d8dee9" "rgb(67 76 94 / 0.9)" "#88c0d0"
+        ["#3b4252", "#bf616a", "#a3be8c", "#ebcb8b", "#81a1c1", "#b48ead", "#88c0d0", "#e5e9f0",
+         "#4c566a", "#bf616a", "#a3be8c", "#ebcb8b", "#81a1c1", "#b48ead", "#8fbcbb", "#eceff4"],
+    s "tokyo-night" "Tokyo Night" :dark "#1a1b26" "#c0caf5" "#c0caf5" "rgb(40 52 87 / 0.9)" "#7aa2f7"
+        ["#15161e", "#f7768e", "#9ece6a", "#e0af68", "#7aa2f7", "#bb9af7", "#7dcfff", "#a9b1d6",
+         "#414868", "#f7768e", "#9ece6a", "#e0af68", "#7aa2f7", "#bb9af7", "#7dcfff", "#c0caf5"],
+    s "catppuccin-mocha" "Catppuccin Mocha" :dark "#1e1e2e" "#cdd6f4" "#f5e0dc" "rgb(88 91 112 / 0.6)" "#cba6f7"
+        ["#45475a", "#f38ba8", "#a6e3a1", "#f9e2af", "#89b4fa", "#f5c2e7", "#94e2d5", "#bac2de",
+         "#585b70", "#f38ba8", "#a6e3a1", "#f9e2af", "#89b4fa", "#f5c2e7", "#94e2d5", "#a6adc8"],
+    s "gruvbox-dark" "Gruvbox Dark" :dark "#282828" "#ebdbb2" "#ebdbb2" "rgb(80 73 69 / 0.9)" "#fe8019"
+        ["#282828", "#cc241d", "#98971a", "#d79921", "#458588", "#b16286", "#689d6a", "#a89984",
+         "#928374", "#fb4934", "#b8bb26", "#fabd2f", "#83a598", "#d3869b", "#8ec07c", "#ebdbb2"],
+    s "one-dark" "One Dark" :dark "#282c34" "#abb2bf" "#528bff" "rgb(62 68 81 / 0.9)" "#61afef"
+        ["#282c34", "#e06c75", "#98c379", "#e5c07b", "#61afef", "#c678dd", "#56b6c2", "#abb2bf",
+         "#5c6370", "#e06c75", "#98c379", "#e5c07b", "#61afef", "#c678dd", "#56b6c2", "#ffffff"],
+    s "solarized-dark" "Solarized Dark" :dark "#002b36" "#839496" "#93a1a1" "rgb(7 54 66 / 0.9)" "#268bd2"
+        ["#073642", "#dc322f", "#859900", "#b58900", "#268bd2", "#d33682", "#2aa198", "#eee8d5",
+         "#002b36", "#cb4b16", "#586e75", "#657b83", "#839496", "#6c71c4", "#93a1a1", "#fdf6e3"],
+    s "solarized-light" "Solarized Light" :light "#fdf6e3" "#657b83" "#586e75" "rgb(238 232 213 / 0.9)" "#268bd2"
+        ["#073642", "#dc322f", "#859900", "#b58900", "#268bd2", "#d33682", "#2aa198", "#eee8d5",
+         "#002b36", "#cb4b16", "#586e75", "#657b83", "#839496", "#6c71c4", "#93a1a1", "#fdf6e3"],
+    s "github-light" "GitHub Light" :light "#ffffff" "#1f2328" "#0969da" "rgb(9 105 218 / 0.18)" "#0969da"
+        ["#24292f", "#cf222e", "#116329", "#4d2d00", "#0969da", "#8250df", "#1b7c83", "#6e7781",
+         "#57606a", "#a40e26", "#1a7f37", "#633c01", "#218bff", "#a475f9", "#3192aa", "#8c959f"],
+];
+
+/// The scheme with this id, or the first.
+let find : :string -> Scheme;
+let find id = match list.find (fn x -> Scheme.id x == id) all { () => list.head all, x => x };
+
+/// The custom properties that apply a scheme to the window.
+let variables : Scheme -> %{:string => :string};
+let variables sc = {
+    let palette = map.from_pairs (list.map_indexed (fn i c -> ["--dw-ansi-" + to_string i, c]) (Scheme.ansi sc));
+    map.merge palette %{
+        "--dw-term-bg" => Scheme.background sc, "--dw-term-fg" => Scheme.foreground sc,
+        "--dw-term-cursor" => Scheme.cursor sc, "--dw-term-select" => Scheme.selection sc,
+        "--dw-accent" => Scheme.accent sc, "--dw-info" => Scheme.accent sc,
+    }
+};
+
+when test {
+    import std.test;
+    let tests = [
+        test.case "every scheme has a full palette" $(test.eq! [] (list.filter (fn x -> len (Scheme.ansi x) != 16) all)),
+        test.case "an unknown scheme is the first" $(test.eq! "sleep-dark" (Scheme.id (find "nope"))),
+        test.case "a scheme is its variables" $(test.eq! ["#282a36", "#ff5555"]
+            [(variables (find "dracula")).["--dw-term-bg"], (variables (find "dracula")).["--dw-ansi-1"]]),
+    ];
+}

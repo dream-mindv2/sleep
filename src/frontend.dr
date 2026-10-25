@@ -1,0 +1,634 @@
+// sleep: a terminal, written in Dream.
+//
+// The window is a strip of tabs over the one being shown -- terminals,
+// request tabs for sending and debugging HTTP, database tabs, and the
+// settings -- a command palette over everything, and a status line under
+// it. Each kind of tab is a small program of its own (`tab_terminal`,
+// `tab_request`, `tab_database`, `tab_settings`); this is the program that
+// holds them, routes the backend's events to the tab each is for, owns the
+// settings, and turns the keyboard's shortcuts into what they do.
+//
+// It runs on the browser VM, in the window `dream --graphics` opens, with
+// `backend.dr` behind it for everything a page cannot do.
+import std.graphics as ui;
+import std.graphics.browser;
+import std.graphics.css;
+import std.graphics.html;
+import std.graphics.widgets as w;
+import std.list;
+import std.map;
+import std.num;
+import std.str;
+import animations;
+import keys;
+import schemes.{Scheme};
+import schemes;
+import settings.{Settings};
+import settings;
+import tab_database;
+import tab_request;
+import tab_settings;
+import tab_terminal;
+import ui_common;
+
+union Tab {
+    terminal(t : tab_terminal.Model)
+    request(r : tab_request.Model)
+    database(d : tab_database.Model)
+    preferences(id : :string)
+}
+
+mapping Palette {
+    open : :bool = false
+    mode : :string = "commands"
+    query : :string = ""
+    items : [[:any]] = []
+    selected : :integer = 0
+}
+
+mapping Model {
+    settings : Settings = Settings.new ()
+    loaded : :bool = false
+    tabs : [Tab] = []
+    active : :string = ""
+    counter : :integer = 0
+    palette : Palette = Palette.new ()
+    risk : :any = ()
+    closing : :any = ()
+    toasts : [[:any]] = []
+    status : :any = ()
+    insights : :any = ()
+    insights_open : :bool = false
+    now : :integer = 0
+    css : :string = ""
+    prefs : tab_settings.Model = tab_settings.Model.new ()
+}
+
+union Msg {
+    loaded(r : Result :any :string)
+    new_terminal
+    new_request
+    new_database
+    open_settings
+    select(id : :string)
+    close(id : :string)
+    close_answer(yes : :bool)
+    term(id : :string, m : tab_terminal.Msg)
+    req(id : :string, m : tab_request.Msg)
+    db(id : :string, m : tab_database.Msg)
+    prefs(m : tab_settings.Msg)
+    event(name : :string, v : :any)
+    key(k : :any)
+    resize(v : :any)
+    tick(now : :integer)
+    palette(mode : :string)
+    palette_query(q : :string)
+    palette_move(d : :integer)
+    palette_pick(v : :any)
+    palette_close
+    palette_results(q : :string, r : Result :any :string)
+    risk_answer(run : :bool)
+    toast_dismiss(id : :integer)
+    insights
+    insights_close
+    model(r : Result :any :string)
+    copied(r : Result :string :string)
+    nothing
+}
+
+// --- tabs --------------------------------------------------------------------------
+
+let tab_id : Tab -> :string;
+let tab_id t = match t {
+    Tab.terminal(x) => tab_terminal.Model.id x,
+    Tab.request(x) => tab_request.Model.id x,
+    Tab.database(x) => tab_database.Model.id x,
+    Tab.preferences(id) => id,
+};
+
+priv let find_tab id m = list.find (fn t -> tab_id t == id) (Model.tabs m);
+priv let replace_tab t m = Model.set_tabs (list.map (fn x -> if tab_id x == tab_id t { t } else { x }) (Model.tabs m)) m;
+priv let active_tab m = find_tab (Model.active m) m;
+priv let active_terminal m = match active_tab m { Tab.terminal(x) => x, _ => () };
+
+priv let fresh_id prefix m = [prefix + to_string (Model.counter m + 1), Model.set_counter (Model.counter m + 1) m];
+
+priv let add_tab t m = m |> Model.set_tabs (list.append (Model.tabs m) [t]) |> Model.set_active (tab_id t);
+
+/// A terminal tab, opened where the active one is.
+priv let open_terminal! m = {
+    let [id, m1] = fresh_id "term" m;
+    let cwd = match active_terminal m { () => "", t => tab_terminal.Model.cwd t };
+    let t = tab_terminal.new id cwd;
+    let m2 = add_tab (Tab.terminal t) m1;
+    run_term! id tab_terminal.Msg.measure m2
+};
+
+priv let switch_to! id m = {
+    let n = Model.set_active id m;
+    match find_tab id n {
+        Tab.terminal(t) => run_term! id tab_terminal.Msg.measure n,
+        _ => n,
+    }
+};
+
+priv let close_now! id m = {
+    match find_tab id m {
+        Tab.terminal(t) => if tab_terminal.Model.session t != "" {
+            browser.invoke! "term_close" %{ "id" => tab_terminal.Model.session t } (fn r -> Msg.nothing)
+        },
+        Tab.database(d) => browser.invoke! "db_close" %{ "tab" => id } (fn r -> Msg.nothing),
+        _ => (),
+    }
+    let ids = list.map tab_id (Model.tabs m);
+    let index = list.index_of id ids;
+    let rest = list.filter (fn t -> tab_id t != id) (Model.tabs m);
+    let n = m |> Model.set_tabs rest |> Model.set_closing ();
+    if rest == [] { open_terminal! n }
+    else if Model.active m == id { switch_to! (tab_id (list.nth (num.min index (len rest - 1)) rest)) n }
+    else { n }
+};
+
+/// A tab's message, given to the tab, and the tab put back.
+priv let run_term! id msg m = match find_tab id m {
+    Tab.terminal(t) => replace_tab (Tab.terminal (tab_terminal.update! (fn x -> Msg.term id x) (Model.settings m) msg t)) m,
+    _ => m,
+};
+priv let run_req! id msg m = match find_tab id m {
+    Tab.request(r) => replace_tab (Tab.request (tab_request.update! (fn x -> Msg.req id x) msg r)) m,
+    _ => m,
+};
+priv let run_db! id msg m = match find_tab id m {
+    Tab.database(d) => replace_tab (Tab.database (tab_database.update! (fn x -> Msg.db id x) msg d)) m,
+    _ => m,
+};
+
+/// The terminal tab whose session is `session`.
+priv let tab_of_session session m = match list.find (fn t -> match t {
+    Tab.terminal(x) => tab_terminal.Model.session x == session, _ => false }) (Model.tabs m) {
+    () => (),
+    t => tab_id t,
+};
+
+// --- settings ------------------------------------------------------------------------
+
+priv let save! s = browser.invoke! "settings_save" (settings.encode s) (fn r -> Msg.nothing);
+
+/// The window's look for these settings: the scheme's variables, the accent.
+priv let scheme_of s = schemes.find (Settings.scheme s);
+priv let mode_of s = match Settings.theme s { :auto => Scheme.mode (scheme_of s), t => t };
+
+priv let apply_settings! old s m = {
+    if Settings.custom_css old != Settings.custom_css s || Model.css m != Settings.custom_css s {
+        browser.js_do! "custom_css" %{ "css" => Settings.custom_css s }
+    }
+    let n = m |> Model.set_settings s |> Model.set_css (Settings.custom_css s);
+    let resized = Settings.font_size old != Settings.font_size s || Settings.line_height old != Settings.line_height s
+        || Settings.font old != Settings.font s || Settings.assistant_open old != Settings.assistant_open s;
+    if resized { match active_terminal n { () => n, t => run_term! (tab_terminal.Model.id t) tab_terminal.Msg.measure n } } else { n }
+};
+
+priv let change_settings! f m = {
+    let s = f (Model.settings m);
+    save! s
+    apply_settings! (Model.settings m) s m
+};
+
+// --- toasts --------------------------------------------------------------------------
+
+priv let toast! tone text m = {
+    let id = Model.counter m + 1;
+    browser.after! 3500 (Msg.toast_dismiss id)
+    m |> Model.set_counter id |> Model.set_toasts (list.append (Model.toasts m) [[id, tone, text]])
+};
+
+// --- actions -------------------------------------------------------------------------
+
+/// What a shortcut, or the palette, does.
+priv let act! action m = match action {
+    "palette" => open_palette! "commands" m,
+    "new_terminal" => open_terminal! m,
+    "new_request" => { let [id, m1] = fresh_id "req" m; add_tab (Tab.request (tab_request.new id "")) m1 },
+    "new_database" => { let [id, m1] = fresh_id "db" m; add_tab (Tab.database (tab_database.new id)) m1 },
+    "open_settings" => match list.find (fn t -> match t { Tab.preferences(_) => true, _ => false }) (Model.tabs m) {
+        () => add_tab (Tab.preferences "settings") m,
+        t => switch_to! (tab_id t) m,
+    },
+    "close_tab" => close! (Model.active m) m,
+    "next_tab" => cycle! 1 m,
+    "previous_tab" => cycle! (-1) m,
+    "queue_command" => match active_terminal m { () => m, t => run_term! (tab_terminal.Model.id t) tab_terminal.Msg.queue_toggle m },
+    "ask" => open_palette! "ask" m,
+    "history" => open_palette! "history" m,
+    "find" => open_palette! "find" m,
+    "toggle_assistant" => change_settings! (fn s -> Settings.set_assistant_open (not (Settings.assistant_open s)) s) m,
+    "copy" => { browser.selected_text! Msg.copied; m },
+    "bigger" => change_settings! (fn s -> Settings.set_font_size (num.min 40 (Settings.font_size s + 1)) s) m,
+    "smaller" => change_settings! (fn s -> Settings.set_font_size (num.max 8 (Settings.font_size s - 1)) s) m,
+    "reset_size" => change_settings! (fn s -> Settings.set_font_size 14 s) m,
+    "clear" => match active_terminal m { () => m, t => run_term! (tab_terminal.Model.id t) (tab_terminal.Msg.insert "\u{c}") m },
+    _ => m,
+};
+
+priv let cycle! d m = match Model.tabs m {
+    [] => m,
+    tabs => {
+        let i = list.index_of (Model.active m) (list.map tab_id tabs);
+        switch_to! (tab_id (list.nth (num.modulo (i + d) (len tabs)) tabs)) m
+    },
+};
+
+/// Close a tab -- asking first when it is running something and the settings say to.
+priv let close! id m = match find_tab id m {
+    Tab.terminal(t) => if tab_terminal.busy t && Settings.confirm_close (Model.settings m) { Model.set_closing id m } else { close_now! id m },
+    () => m,
+    _ => close_now! id m,
+};
+
+// --- the palette ---------------------------------------------------------------------
+
+priv let command_items m = list.concat [
+    list.map (fn a -> [["act", list.head a], list.nth 2 a, "", settings.chord_for (Model.settings m) (list.head a)])
+        (list.filter (fn a -> list.head a != "palette") settings.actions),
+    list.map (fn t -> [["tab", tab_id t], "Go to: " + tab_title t, "tab", ""]) (Model.tabs m),
+    list.map (fn sc -> [["scheme", Scheme.id sc], "Colour scheme: " + Scheme.name sc, "", ""]) schemes.all,
+    [[["act", "insights"], "Show insights", "what the assistant has learned", ""]],
+];
+
+/// A query's score against a title: every character in order, earlier and
+/// together counting for more. `()` when they are not all there.
+priv let fuzzy q title = {
+    let qs = str.chars (str.lower q);
+    let ts = str.chars (str.lower title);
+    let rec go qs ts i last score = match qs {
+        [] => score,
+        _ => match ts {
+            [] => (),
+            _ => if list.head qs == list.head ts { go (list.tail qs) (list.tail ts) (i + 1) i (score + (if last == i - 1 { 3 } else { 1 }) - i / 20) }
+                 else { go qs (list.tail ts) (i + 1) last score },
+        },
+    };
+    go qs ts 0 (-2) 0
+};
+
+priv let filter_commands q m = if q == "" { command_items m } else {
+    let scored = list.flat_map (fn it -> match fuzzy q (list.nth 1 it) { () => [], s => [[s, it]] }) (command_items m);
+    list.map (fn p -> list.nth 1 p) (list.sort_by (fn a b -> list.head a > list.head b) scored)
+};
+
+priv let find_items q m = match active_terminal m {
+    () => [],
+    t => if str.length q < 2 { [] } else {
+        let lines = map.sorted_pairs (tab_terminal.Model.lines t);
+        let hits = list.filter (fn p -> str.contains_str (str.lower q) (str.lower (span_text (list.nth 1 p)))) lines;
+        list.map (fn p -> [["line", list.head p], ui_common.clip 90 (span_text (list.nth 1 p)), "line " + to_string (list.head p), ""])
+            (list.take 50 (list.reverse hits))
+    },
+};
+priv let span_text spans = str.concat_all (list.map list.head spans);
+
+priv let open_palette! mode m = {
+    let p = Palette.new () |> Palette.set_open true |> Palette.set_mode mode;
+    let items = match mode { "commands" => command_items m, _ => [] };
+    let n = Model.set_palette (Palette.set_items items p) m;
+    if mode == "history" { browser.invoke! "assist_history" %{ "query" => "" } (fn r -> Msg.palette_results "" r) }
+    n
+};
+
+priv let query_palette! q m = {
+    let p = Model.palette m |> Palette.set_query q |> Palette.set_selected 0;
+    match Palette.mode p {
+        "commands" => Model.set_palette (Palette.set_items (filter_commands q m) p) m,
+        "find" => Model.set_palette (Palette.set_items (find_items q m) p) m,
+        "history" => { browser.invoke! "assist_history" %{ "query" => q } (fn r -> Msg.palette_results q r); Model.set_palette p m },
+        _ => { if str.length q > 2 { browser.invoke! "assist_ask" %{ "question" => q } (fn r -> Msg.palette_results q r) }; Model.set_palette p m },
+    }
+};
+
+priv let pick! v m = {
+    let closed = Model.set_palette (Palette.set_open false (Model.palette m)) m;
+    let term_id = match active_terminal closed { () => "", t => tab_terminal.Model.id t };
+    match v {
+        ["act", "insights"] => open_insights! closed,
+        ["act", a] => act! a closed,
+        ["tab", id] => switch_to! id closed,
+        ["scheme", id] => change_settings! (fn s -> Settings.set_scheme id s) closed,
+        ["line", n] => if term_id == "" { closed } else { run_term! term_id (tab_terminal.Msg.jump n) closed },
+        ["insert", c] => if term_id == "" { closed } else { run_term! term_id (tab_terminal.Msg.insert c) closed },
+        _ => closed,
+    }
+};
+
+priv let open_insights! m = {
+    browser.invoke! "assist_insights" %{} (fn r -> Msg.nothing)
+    m |> Model.set_insights_open true
+};
+
+// --- update --------------------------------------------------------------------------
+
+let update! : Msg -> Model -> Model;
+let update! msg m = match msg {
+    Msg.loaded(r) => {
+        let s = match r { Result.ok(v) => settings.decode v, Result.error(_) => Settings.new () };
+        browser.invoke! "assist_model" %{} Msg.model
+        open_terminal! (apply_settings! (Settings.new ()) s (Model.set_loaded true m))
+    },
+    Msg.new_terminal => act! "new_terminal" m,
+    Msg.new_request => act! "new_request" m,
+    Msg.new_database => act! "new_database" m,
+    Msg.open_settings => act! "open_settings" m,
+    Msg.select(id) => switch_to! id m,
+    Msg.close(id) => close! id m,
+    Msg.close_answer(yes) => match Model.closing m { () => m, id => if yes { close_now! id m } else { Model.set_closing () m } },
+    // A shortcut pressed in a terminal reaches the window's own listener too
+    // (`Msg.key`), which is where every shortcut is acted on; the terminal
+    // only stays out of its way.
+    Msg.term(id, tm) => match tm {
+        tab_terminal.Msg.key(k) => if settings.action_for (Model.settings m) (keys.chord k) != "" { m } else { run_term! id tm m },
+        _ => run_term! id tm m,
+    },
+    Msg.req(id, rm) => match rm {
+        tab_request.Msg.send => run_req! id rm m,
+        _ => run_req! id rm m,
+    },
+    Msg.db(id, dm) => run_db! id dm m,
+    Msg.prefs(pm) => {
+        let [p, s] = tab_settings.update pm (Model.prefs m) (Model.settings m);
+        let n = Model.set_prefs p m;
+        if s == Model.settings m { n } else { save! s; apply_settings! (Model.settings m) s n }
+    },
+    Msg.event(name, v) => match name {
+        "assistant" => { browser.invoke! "assist_model" %{} Msg.model; m },
+        "model" => Model.set_status v m,
+        "insights" => Model.set_insights v m,
+        "http" => run_req! (v.["tab" else ""]) (tab_request.Msg.answered v) m,
+        "db" => run_db! (v.["tab" else ""]) (tab_database.Msg.answered v) m,
+        "risk" => match tab_of_session (v.["id" else ""]) m { () => m, id => Model.set_risk (v.["tab" => id]) m },
+        _ => match tab_of_session (v.["id" else ""]) m {
+            () => m,
+            id => {
+                let n = run_term! id (tab_terminal.Msg.event name v) m;
+                if name == "bell" && Settings.bell (Model.settings m) { browser.js_do! "beep" %{} }
+                if name == "exit" && v.["code" else 0] != 0 { toast! :warning ("A terminal's shell exited with status " + to_string v.["code"]) n } else { n }
+            },
+        },
+    },
+    Msg.key(k) => {
+        let recording = tab_settings.Model.recording (Model.prefs m) != "";
+        let in_terminal = match active_terminal m { () => false, t => tab_terminal.Model.focused t };
+        let chord = keys.chord k;
+        let action = settings.action_for (Model.settings m) chord;
+        let modified = k.["ctrl" else false] == true || k.["alt" else false] == true || k.["meta" else false] == true;
+        let run_key = k.["key" else ""] == "Enter" && (k.["ctrl" else false] == true || k.["meta" else false] == true)
+            && match active_tab m { Tab.request(_) => true, Tab.database(_) => true, _ => false };
+        if recording { update! (Msg.prefs (tab_settings.Msg.recorded k)) m }
+        else if Palette.open (Model.palette m) { m }
+        // Ctrl+Enter sends a request or runs a query from anywhere in its
+        // tab, not only from the editor: it is what a field's Enter would be
+        // if the tab were one form.
+        else if run_key && action == "" { match active_tab m {
+            Tab.request(r) => run_req! (tab_request.Model.id r) tab_request.Msg.send m,
+            Tab.database(d) => run_db! (tab_database.Model.id d) tab_database.Msg.run m,
+            _ => m,
+        } }
+        else if action != "" && (modified || in_terminal || k.["in_field" else false] == false) { act! action m }
+        else if in_terminal { m }
+        else {
+            // A key typed with nothing focused goes to the terminal shown.
+            match active_terminal m {
+                () => m,
+                t => if k.["in_field" else false] == false && not modified && str.length (k.["key" else ""]) == 1 {
+                    browser.focus! (tab_terminal.input_key t)
+                    run_term! (tab_terminal.Model.id t) (tab_terminal.Msg.key k) m
+                } else { m },
+            }
+        }
+    },
+    Msg.resize(v) => match active_terminal m { () => m, t => run_term! (tab_terminal.Model.id t) tab_terminal.Msg.measure m },
+    Msg.tick(now) => {
+        let n = Model.set_now now m;
+        list.fold (fn acc t -> match t {
+            Tab.terminal(x) => if tab_terminal.ticking x { run_term! (tab_terminal.Model.id x) (tab_terminal.Msg.tick now) acc } else { acc },
+            _ => acc,
+        }) n (Model.tabs n)
+    },
+    Msg.palette(mode) => open_palette! mode m,
+    Msg.palette_query(q) => query_palette! q m,
+    Msg.palette_move(d) => {
+        let p = Model.palette m;
+        let count = len (Palette.items p);
+        if count == 0 { m } else { Model.set_palette (Palette.set_selected (num.modulo (Palette.selected p + d) count) p) m }
+    },
+    Msg.palette_pick(v) => pick! v m,
+    Msg.palette_close => {
+        match active_terminal m { () => (), t => browser.focus! (tab_terminal.input_key t) }
+        Model.set_palette (Palette.set_open false (Model.palette m)) m
+    },
+    Msg.palette_results(q, r) => if q != Palette.query (Model.palette m) { m } else {
+        match r {
+            Result.ok(results) => Model.set_palette (Palette.set_items (list.map (fn x ->
+                [["insert", x.["command"]], x.["command"], if Palette.mode (Model.palette m) == "ask" { x.["note" else ""] } else { x.["cwd" else ""] }, ""]) results)
+                (Model.palette m)) m,
+            Result.error(_) => m,
+        }
+    },
+    Msg.risk_answer(run) => match Model.risk m {
+        () => m,
+        r => {
+            match find_tab (r.["tab"]) m {
+                Tab.terminal(t) => if run {
+                    browser.invoke! "term_input" %{ "id" => tab_terminal.Model.session t, "data" => "\r", "force" => true } (fn x -> Msg.nothing)
+                } else { browser.focus! (tab_terminal.input_key t) },
+                _ => (),
+            }
+            Model.set_risk () m
+        },
+    },
+    Msg.toast_dismiss(id) => Model.set_toasts (list.filter (fn t -> list.head t != id) (Model.toasts m)) m,
+    Msg.insights => open_insights! m,
+    Msg.insights_close => Model.set_insights_open false m,
+    Msg.model(r) => match r { Result.ok(v) => Model.set_status v m, _ => m },
+    Msg.copied(r) => match r {
+        Result.ok("") => m,
+        Result.ok(text) => { browser.copy! text; toast! :success "Copied" m },
+        _ => m,
+    },
+    Msg.nothing => m,
+};
+
+// --- the view ------------------------------------------------------------------------
+
+priv let tab_title t = match t {
+    Tab.terminal(x) => tab_terminal.title x,
+    Tab.request(x) => tab_request.title x,
+    Tab.database(x) => tab_database.title x,
+    Tab.preferences(_) => "Settings",
+};
+priv let tab_icon t = match t { Tab.terminal(_) => "terminal", Tab.request(_) => "globe", Tab.database(_) => "database", _ => "settings" };
+priv let tab_state t = match t { Tab.terminal(x) => tab_terminal.state x, Tab.request(x) => if tab_request.Model.sending x { "busy" } else { "" },
+    Tab.database(x) => if tab_database.Model.running x { "busy" } else { "" }, _ => "" };
+
+priv let brand = ui.element "div" [html.class "sl-brand"] [ui.element "span" [html.class "sl-moon"] [], ui.text "sleep"];
+
+priv let toolbar m = w.toolbar [
+    brand,
+    w.doc_tabs (list.map (fn t -> [tab_id t, tab_title t, tab_icon t, tab_state t]) (Model.tabs m)) (Model.active m) Msg.select Msg.close,
+    w.icon_button "terminal" ("New terminal (" + settings.chord_for (Model.settings m) "new_terminal" + ")") Msg.new_terminal |> w.ghost |> w.small,
+    w.icon_button "globe" ("New request (" + settings.chord_for (Model.settings m) "new_request" + ")") Msg.new_request |> w.ghost |> w.small,
+    w.icon_button "database" ("New database tab (" + settings.chord_for (Model.settings m) "new_database" + ")") Msg.new_database |> w.ghost |> w.small,
+    w.spacer,
+    w.icon_button "activity" "Insights" Msg.insights |> w.ghost |> w.small,
+    w.icon_button "command" ("Command palette (" + settings.chord_for (Model.settings m) "palette" + ")") (Msg.palette "commands") |> w.ghost |> w.small,
+    w.icon_button "settings" "Settings" Msg.open_settings |> w.ghost |> w.small,
+] |> w.gap 1;
+
+priv let body m = match active_tab m {
+    () => w.workspace [w.center [w.spinner, w.caption "Starting…"]],
+    Tab.terminal(t) => tab_terminal.view (fn x -> Msg.term (tab_terminal.Model.id t) x) (Model.settings m) (Model.status m) (Model.now m) t,
+    Tab.request(r) => tab_request.view (fn x -> Msg.req (tab_request.Model.id r) x) r,
+    Tab.database(d) => tab_database.view (fn x -> Msg.db (tab_database.Model.id d) x) d,
+    Tab.preferences(_) => tab_settings.view Msg.prefs (Model.prefs m) (Model.settings m) (Model.status m),
+};
+
+priv let status_line m = {
+    let s = Model.status m;
+    w.status_bar [
+        match active_tab m {
+            Tab.terminal(t) => w.caption (tab_terminal.Model.cwd t),
+            Tab.request(r) => w.caption "HTTP",
+            Tab.database(d) => w.caption (if tab_database.Model.connected d { tab_database.Model.kind d + " · connected" } else { "not connected" }),
+            _ => w.caption "",
+        },
+        w.spacer,
+        if s == () { ui.nothing } else {
+            w.caption ("assistant: " + to_string s.["commands" else 0] + " commands"
+                + (if s.["training" else false] { " · training…" } else if s.["trained" else false] { " · network " + ui_common.percent (s.["accuracy" else 0.0]) } else { "" }))
+        },
+        w.kbd (settings.chord_for (Model.settings m) "palette"),
+        w.caption "commands",
+    ]
+};
+
+priv let palette_view m = {
+    let p = Model.palette m;
+    w.palette (w.Palette.new () |> w.Palette.set_open (Palette.open p) |> w.Palette.set_query (Palette.query p)
+        |> w.Palette.set_items (Palette.items p) |> w.Palette.set_selected (Palette.selected p)
+        |> w.Palette.set_placeholder (match Palette.mode p {
+            "history" => "Search your history (misspellings welcome)",
+            "ask" => "Ask for a command, in words",
+            "find" => "Find in this terminal's scrollback",
+            _ => "Type a command" })
+        |> w.Palette.set_empty (match Palette.mode p { "ask" => "Describe what you want to do", "find" => "Type at least two letters", _ => "Nothing matches" })
+        |> w.Palette.set_on_query Msg.palette_query |> w.Palette.set_on_move Msg.palette_move
+        |> w.Palette.set_on_pick Msg.palette_pick |> w.Palette.set_on_close Msg.palette_close)
+};
+
+priv let risk_view m = match Model.risk m {
+    () => ui.nothing,
+    r => w.dialog true "Run this?" [
+        w.code_block r.["command"],
+        w.text "sleep's guard thinks this cannot be undone:",
+        w.column (list.map (fn reason -> w.row [w.icon "alert", w.text reason] |> w.tone :danger) (r.["reasons" else []])) |> w.gap 1,
+        w.caption ("confidence " + ui_common.percent (r.["p" else 0.0]) + ". Allowing the same command twice stops the question."),
+    ] [w.button "Cancel" (Msg.risk_answer false), w.button "Run it" (Msg.risk_answer true) |> w.danger] (Msg.risk_answer false)
+};
+
+priv let closing_view m = match Model.closing m {
+    () => ui.nothing,
+    id => w.dialog true "Close this terminal?" [w.text "A command is still running in it, and closing the tab stops it."]
+        [w.button "Keep it" (Msg.close_answer false), w.button "Close" (Msg.close_answer true) |> w.danger] (Msg.close_answer false),
+};
+
+priv let insights_view m = if not (Model.insights_open m) { ui.nothing } else {
+    match Model.insights m {
+        () => w.dialog true "Insights" [w.center [w.spinner, w.caption "Looking through your history…"]] [w.button "Close" Msg.insights_close] Msg.insights_close,
+        i => w.dialog true "Insights" [
+            w.row [w.badge (to_string i.["commands" else 0] + " commands"), w.badge (to_string i.["distinct" else 0] + " kinds"),
+                   w.spacer, w.caption "by hour", w.sparkline (i.["hours" else []]) |> w.width "8rem"],
+            w.heading "Your workflows",
+            w.column (list.map_indexed (fn j wf -> w.card [w.row [w.strong wf.["name"], w.spacer, w.caption (to_string wf.["runs"] + " runs")],
+                w.row (list.map (fn c -> w.code (ui_common.clip 40 c)) wf.["commands"]) |> w.gap 1] |> w.padding 3 |> ui.keyed ("wf" + to_string j))
+                (i.["workflows" else []])) |> w.gap 2,
+            w.grid 2 [
+                w.section "Most run" [w.pairs (list.map (fn p -> [list.head p, to_string (list.nth 1 p)]) (i.["top" else []]))],
+                w.section "Fail most" [w.pairs (list.map (fn p -> [list.head p, to_string (list.nth 1 p) + "% of " + to_string (list.nth 2 p)]) (i.["failing" else []]))],
+            ],
+            w.section "Where the time goes" [w.pairs (list.map (fn p -> [list.head p, ui_common.duration (list.nth 1 p) + " in all, " + ui_common.duration (list.nth 2 p) + " usually"]) (i.["slowest" else []]))],
+        ] [w.button "Close" Msg.insights_close |> w.primary] Msg.insights_close |> ui.attribute "class" "sl-insights",
+    }
+};
+
+let view : Model -> ui.Node;
+let view m = {
+    let s = Model.settings m;
+    let vars = schemes.variables (scheme_of s);
+    let accented = if Settings.accent s == "" { vars } else { map.merge vars %{ "--dw-accent" => Settings.accent s, "--dw-info" => Settings.accent s } };
+    w.frame [
+        toolbar m,
+        body m,
+        status_line m,
+        palette_view m,
+        risk_view m,
+        closing_view m,
+        insights_view m,
+        w.toasts (list.map (fn t -> w.toast (list.nth 1 t) (list.nth 2 t) (Msg.toast_dismiss (list.head t)) |> ui.keyed ("toast" + to_string (list.head t))) (Model.toasts m)),
+    ] |> w.mode (mode_of s) |> ui.styled accented
+};
+
+let subscriptions : Model -> [ui.Sub];
+let subscriptions m = {
+    let ticking = list.any (fn t -> match t { Tab.terminal(x) => tab_terminal.ticking x, _ => false }) (Model.tabs m);
+    list.concat [
+        [ui.on_key_down Msg.key, ui.on_resize Msg.resize],
+        list.map (fn name -> ui.on_backend name (fn v -> Msg.event name v))
+            ["screen", "status", "started", "block", "insight", "ghost", "queue", "bell", "exit", "risk", "assistant", "model", "insights", "http", "db"],
+        if ticking { [ui.every 250 Msg.tick] } else { [] },
+    ]
+};
+
+let start! : Model -> Model;
+let start! m = { browser.invoke! "settings_load" %{} Msg.loaded; m };
+
+/// The window's own styles, under the widgets' and over nothing else.
+let styles : [:string];
+let styles = list.concat [
+    [
+        css.rule "html, body" %{ "margin" => "0", "height" => "100%", "overflow" => "hidden" },
+        css.rule ".sl-brand" %{ "display" => "flex", "align-items" => "center", "gap" => "0.45rem", "font-weight" => "700", "letter-spacing" => "-0.02em",
+            "padding" => "0 0.6rem 0 0.35rem", "color" => "var(--dw-text)" },
+        css.rule ".sl-moon" %{ "width" => "14px", "height" => "14px", "border-radius" => "50%",
+            "box-shadow" => "inset -4px -2px 0 0 var(--dw-accent)", "transform" => "rotate(-20deg)" },
+        css.rule ".sl-queue" %{ "position" => "absolute", "top" => "3.2rem", "right" => "1rem", "z-index" => "5", "width" => "min(26rem, calc(100% - 2rem))",
+            "padding" => "var(--dw-space-3)", "gap" => "var(--dw-space-2)", "animation" => "dw-rise 140ms ease-out" },
+        css.rule ".sl-sql" %{ "min-height" => "9rem", "resize" => "vertical", "line-height" => "1.5" },
+        css.rule ".sl-schemes" %{ "display" => "grid", "grid-template-columns" => "repeat(auto-fill, minmax(11rem, 1fr))", "gap" => "var(--dw-space-3)" },
+        css.rule ".sl-scheme" %{ "display" => "flex", "flex-direction" => "column", "gap" => "0.4rem", "padding" => "0.4rem", "border-radius" => "calc(var(--dw-radius) + 2px)",
+            "border" => "1px solid var(--dw-border)", "background" => "var(--dw-surface)", "color" => "var(--dw-text)", "cursor" => "pointer", "font" => "inherit",
+            "text-align" => "left", "transition" => "border-color 120ms, transform 120ms" },
+        css.rule ".sl-scheme:hover" %{ "transform" => "translateY(-1px)", "border-color" => "var(--dw-accent)" },
+        css.rule ".sl-scheme-on" %{ "border-color" => "var(--dw-accent)", "box-shadow" => "0 0 0 2px var(--dw-accent)" },
+        css.rule ".sl-scheme-preview" %{ "display" => "flex", "flex-direction" => "column", "gap" => "0.15rem", "padding" => "0.55rem 0.6rem", "border-radius" => "var(--dw-radius)",
+            "font" => "12px/1.4 ui-monospace, monospace" },
+        css.rule ".sl-scheme-swatches" %{ "display" => "flex", "gap" => "3px", "margin-top" => "0.3rem" },
+        css.rule ".sl-swatch" %{ "width" => "12px", "height" => "12px", "border-radius" => "3px" },
+        css.rule ".sl-scheme-name" %{ "font-size" => "0.85rem", "font-weight" => "600", "padding" => "0 0.2rem 0.1rem" },
+        css.rule ".sl-insights" %{ "width" => "min(46rem, calc(100vw - 2rem))", "max-height" => "85vh" },
+        css.rule ".dw-terminal" %{ "scrollbar-width" => "thin" },
+    ],
+    animations.styles,
+];
+
+let main! = w.run! (ui.App.new () |> ui.title "sleep" |> ui.App.set_init (Model.new ()) |> ui.App.set_start start!
+    |> ui.App.set_update update! |> ui.App.set_view view |> ui.App.set_subscriptions subscriptions
+    |> ui.App.set_styles styles |> ui.App.set_window (ui.Window.new () |> ui.Window.set_title "sleep" |> ui.Window.set_width 1280 |> ui.Window.set_height 800));
+
+when test {
+    import std.test;
+    let tests = [
+        test.case "fuzzy matching scores runs higher than scattered letters" $({
+            test.eq! () (fuzzy "xz" "New terminal tab")
+            test.true! (fuzzy "term" "New terminal tab" > fuzzy "ntt" "New terminal tab")
+        }),
+        test.case "a tab is known by its id" $(test.eq! ["t1", "settings"] [tab_id (Tab.terminal (tab_terminal.new "t1" "")), tab_id (Tab.preferences "settings")]),
+    ];
+}

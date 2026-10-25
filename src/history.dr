@@ -1,0 +1,159 @@
+// What a person has run: the shell's own history files, read once, and
+// sleep's log of every command it saw finish -- with where it ran, how it
+// ended and how long it took, which a shell's history does not keep.
+//
+// Everything the assistant learns is learned from this. It never leaves the
+// machine: the log is a file of JSON lines in the person's data directory.
+import std.file;
+import std.json;
+import std.list;
+import std.map;
+import std.num;
+import std.os;
+import std.path;
+import std.str;
+
+/// One command. `exit` is `-1` and `duration` `0` where they are not known
+/// (a line from the shell's history); `start` is milliseconds since the epoch.
+mapping Entry {
+    command : :string = ""
+    cwd : :string = ""
+    exit : :integer = -1
+    start : :integer = 0
+    duration : :integer = 0
+}
+
+/// A command's program, past `sudo`, `env`, `time`, `nohup` and leading
+/// `NAME=value` assignments: what the command *is*.
+let head : :string -> :string;
+let head command = {
+    let words = list.filter (fn w -> w != "") (str.split " " (str.trim command));
+    let skip = ["sudo", "env", "time", "nohup", "exec", "command", "builtin", "doas", "nice"];
+    let rest = list.drop_while (fn w -> list.contains w skip || (str.contains_str "=" w && not (str.starts_with "-" w))) words;
+    match rest { [] => "", _ => path.basename (list.head rest) }
+};
+
+/// The programs whose first argument is a command of their own.
+priv let with_subcommands = ["git", "docker", "kubectl", "npm", "yarn", "pnpm", "cargo", "go", "systemctl", "brew",
+    "apt", "dnf", "pacman", "nix", "pip", "pip3", "just", "make", "mind", "dotnet", "gh", "terraform", "helm", "poetry", "uv"];
+
+/// A command's program and, for one like `git`, its subcommand: `"git push"`.
+let kind : :string -> :string;
+let kind command = {
+    let h = head command;
+    if not (list.contains h with_subcommands) { h } else {
+        let words = list.filter (fn w -> w != "") (str.split " " (str.trim command));
+        let after = list.drop 1 (list.drop_while (fn w -> path.basename w != h) words);
+        match list.filter (fn w -> not (str.starts_with "-" w)) after { [] => h, sub => h + " " + list.head sub }
+    }
+};
+
+/// Where sleep keeps its data: `$XDG_DATA_HOME/sleep`, or `~/.local/share/sleep`.
+let data_dir! : :unit -> :string;
+let data_dir! u = {
+    let home = match path.home! () { () => "/tmp", h => h };
+    let base = match os.env! "XDG_DATA_HOME" { () => path.join home ".local/share", "" => path.join home ".local/share", d => d };
+    path.join base "sleep"
+};
+
+priv let log_file! u = path.join (data_dir! ()) "history.jsonl";
+
+/// A zsh history line, `: 1700000000:0;command` when extended, or plain.
+priv let zsh_line l = if str.starts_with ": " l {
+    match str.split_once ";" l {
+        () => Entry.new () |> Entry.set_command l,
+        [stamp, command] => {
+            let seconds = match num.parse_int (str.trim (list.head (str.split ":" (str.trim_prefix ": " stamp)))) { () => 0, n => n };
+            Entry.new () |> Entry.set_command command |> Entry.set_start (seconds * 1000)
+        },
+    }
+} else { Entry.new () |> Entry.set_command l };
+
+/// The shell's own history, oldest first: `$HISTFILE`, `~/.zsh_history` and
+/// `~/.bash_history`, the last 20,000 lines of each. A bash timestamp line
+/// (`#1700000000`) dates the command after it.
+let shell_history! : :unit -> [Entry];
+let shell_history! u = {
+    let home = match path.home! () { () => "", h => h };
+    let candidates = list.filter (fn p -> p != "") [match os.env! "HISTFILE" { () => "", f => f },
+        path.join home ".zsh_history", path.join home ".bash_history"];
+    let read_one = fn p -> match file.read! p {
+        () => [],
+        text => {
+            let lines = list.filter (fn l -> str.trim l != "") (str.lines text);
+            let recent = list.drop (num.max 0 (len lines - 20000)) lines;
+            if str.ends_with "zsh_history" p { list.map zsh_line recent } else {
+                let rec go ls stamp acc = match ls {
+                    [] => list.reverse acc,
+                    _ => {
+                        let l = list.head ls;
+                        match (if str.starts_with "#" l { num.parse_int (str.trim_prefix "#" l) } else { () }) {
+                            () => go (list.tail ls) 0 (list.cons (Entry.new () |> Entry.set_command l |> Entry.set_start stamp) acc),
+                            seconds => go (list.tail ls) (seconds * 1000) acc,
+                        }
+                    },
+                };
+                go recent 0 []
+            }
+        },
+    };
+    list.filter (fn e -> Entry.command e != "") (list.flat_map read_one (list.unique candidates))
+};
+
+/// An entry as a line of the log.
+let encode : Entry -> :string;
+let encode e = json.encode %{ "command" => Entry.command e, "cwd" => Entry.cwd e, "exit" => Entry.exit e,
+    "start" => Entry.start e, "duration" => Entry.duration e };
+
+/// A line of the log as an entry, or nothing for one that is not.
+let decode : :string -> Option Entry;
+let decode line = match json.decode line {
+    Result.ok(m) => if type_of m != :map || type_of (m.["command" else ()]) != :string { Option.none } else {
+        let int = fn k -> match m.[k else 0] { n => if type_of n == :integer { n } else { 0 } };
+        Option.some (Entry.new () |> Entry.set_command m.["command"] |> Entry.set_cwd (match m.["cwd" else ""] { c => if type_of c == :string { c } else { "" } })
+            |> Entry.set_exit (match m.["exit" else -1] { n => if type_of n == :integer { n } else { -1 } })
+            |> Entry.set_start (int "start") |> Entry.set_duration (int "duration"))
+    },
+    Result.error(_) => Option.none,
+};
+
+/// sleep's own log, oldest first, the last 50,000 entries.
+let own! : :unit -> [Entry];
+let own! u = match file.read! (log_file! ()) {
+    () => [],
+    text => {
+        let lines = str.lines text;
+        list.flat_map (fn l -> match decode l { Option.some(e) => [e], Option.none => [] }) (list.drop (num.max 0 (len lines - 50000)) lines)
+    },
+};
+
+/// Add an entry to the log.
+let record! : Entry -> :unit;
+let record! e = {
+    file.mkdir_all! (data_dir! ())
+    file.append! (log_file! ()) (encode e + "\n")
+};
+
+/// Everything known, oldest first: the shell's history, then sleep's log,
+/// with a command the log repeats from the shell's history counted once more,
+/// as it was run once more.
+let load! : :unit -> [Entry];
+let load! u = list.append (shell_history! ()) (own! ());
+
+when test {
+    import std.test;
+    let tests = [
+        test.case "a command's program is past sudo and assignments" $(test.eq! ["rm", "make", "python3", ""]
+            [head "sudo rm -rf build", head "CC=clang make -j8", head "/usr/bin/python3 x.py", head "   "]),
+        test.case "a command's kind includes a subcommand" $(test.eq! ["git push", "docker compose", "ls", "git"]
+            [kind "git push origin main", kind "docker compose up -d", kind "ls -la", kind "git --version"]),
+        test.case "a zsh history line keeps its time" $({
+            let e = zsh_line ": 1700000000:0;git status";
+            test.eq! ["git status", 1700000000000] [Entry.command e, Entry.start e]
+        }),
+        test.case "an entry survives the log" $({
+            let e = Entry.new () |> Entry.set_command "ls \"x\"" |> Entry.set_cwd "/tmp" |> Entry.set_exit 2 |> Entry.set_duration 15;
+            test.eq! (Option.some e) (decode (encode e))
+        }),
+    ];
+}

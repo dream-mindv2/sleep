@@ -1,0 +1,172 @@
+// The assistant: one process holding everything sleep has learned, learning
+// more as each command finishes, and answering what the window asks.
+//
+// It starts empty and loads the history in the background, so the first
+// terminal opens at once; until it has, completions are empty and questions
+// are answered from what it has. Each finished command is recorded, counted
+// into the n-gram model, the run-time averages and the error classifier, and
+// answered with what the window shows under it: corrections for a command
+// that was not found, the likely cause of a failure and its fix, the lines
+// worth reading, and what will probably be run next. Every 150 commands the
+// network is retrained, in a process of its own, and swapped in when done.
+//
+// The models are the modules beside this one; this is only their keeper.
+import std.graphics.backend;
+import std.list;
+import std.map;
+import std.ml.bayes;
+import std.ml.text;
+import std.num;
+import std.proc;
+import std.str;
+import std.time;
+import cookbook;
+import explain;
+import fix;
+import history.{Entry};
+import history;
+import insights;
+import predict.{Predictor, Net};
+import predict;
+
+mapping State {
+    events : :any = ()
+    ready : :bool = false
+    entries : [Entry] = []
+    predictor : Predictor = Predictor.new ()
+    stats : %{:string => insights.Stat} = %{}
+    kinds : %{:string => :integer} = %{}
+    classifier : bayes.Model = explain.classifier
+    programs : [:string] = []
+    since_training : :integer = 0
+    training : :bool = false
+    train : :bool = true
+    search : :any = ()
+}
+
+/// Start the assistant, reporting through `events`. `train` is whether it
+/// may train its network.
+let start! : :any -> :bool -> :process;
+let start! events train = {
+    let me = spawn! $( loop! (State.new () |> State.set_events events |> State.set_train train) );
+    spawn! $( { send! me [:loaded, history.load! (), fix.programs! ()]; () } )
+    me
+};
+
+priv let rec loop! !s = loop! (handle! (recv! ()) s);
+
+priv let hour_now! u = (time.to_milliseconds (time.now! ()) / 3600000) % 24;
+
+priv let kinds_of entries = list.fold (fn m e -> {
+    let c = Entry.command e;
+    let h = history.head c;
+    let k = history.kind c;
+    let m1 = if h == "" { m } else { map.update_strict 0 (fn n -> n + 1) h m };
+    if k == h || k == "" { m1 } else { map.update_strict 0 (fn n -> n + 1) k m1 }
+}) map.empty entries;
+
+priv let handle! m s = if proc.is_call m { { proc.reply! m (answer! (proc.call_body m) s); s } } else { match m {
+    [:loaded, entries, programs] => {
+        let ready = s |> State.set_entries entries |> State.set_predictor (predict.build entries)
+            |> State.set_stats (insights.durations entries) |> State.set_kinds (kinds_of entries)
+            |> State.set_programs programs |> State.set_ready true;
+        backend.emit! (State.events ready) "assistant" %{ "ready" => true, "commands" => len entries }
+        maybe_train! ready
+    },
+    [:complete, reply, typed, recent] => {
+        send! reply [:ghost, typed, if State.ready s { predict.complete (State.predictor s) recent typed } else { "" }]
+        s
+    },
+    [:finished, id, entry, lines, first_line, recent] => finished! id entry lines first_line recent s,
+    [:trained, net] => {
+        let n = s |> State.set_predictor (Predictor.set_net net (State.predictor s)) |> State.set_training false;
+        backend.emit! (State.events n) "model" (model_status n)
+        n
+    },
+    [:insights, reply] => {
+        spawn! $( { send! reply [:insights, insights_of s]; () } )
+        s
+    },
+    [:settings, train] => State.set_train train s,
+    _ => s,
+} };
+
+/// What a request from the window is answered.
+priv let answer! request s = match request {
+    [:ask, question] => cookbook.ask question 6,
+    [:history, query] => search_history query s,
+    [:predict, recent, cwd] => if State.ready s { list.map (fn p -> %{ "command" => list.head p, "p" => list.nth 1 p })
+        (predict.next (State.predictor s) recent cwd (hour_now! ()) 5) } else { [] },
+    [:expected, command] => insights.expected (State.stats s) command,
+    [:model] => model_status s,
+    _ => (),
+};
+
+priv let model_status s = {
+    let net = Predictor.net (State.predictor s);
+    %{ "ready" => State.ready s, "commands" => len (State.entries s), "training" => State.training s,
+       "examples" => Net.examples net, "accuracy" => Net.accuracy net, "classes" => len (Net.vocabulary net),
+       "trained" => Net.fitted net != () }
+};
+
+/// The history's commands most like `query`, by character trigrams, so a
+/// misspelled or half-remembered command is found; each once, most recent first.
+priv let search_history query s = {
+    let recent = list.take 3000 (list.reverse (State.entries s));
+    let distinct = list.unique_on Entry.command recent;
+    if str.trim query == "" {
+        list.map (fn e -> %{ "command" => Entry.command e, "cwd" => Entry.cwd e, "exit" => Entry.exit e, "score" => 1.0 }) (list.take 30 distinct)
+    } else {
+        let ix = text.index (text.char_ngrams 3) (list.map (fn e -> [e, Entry.command e]) distinct);
+        list.map (fn hit -> {
+            let e = list.head hit;
+            %{ "command" => Entry.command e, "cwd" => Entry.cwd e, "exit" => Entry.exit e, "score" => list.nth 1 hit }
+        }) (text.search ix query 30)
+    }
+};
+
+/// A command finished: learn from it, and tell the window what is worth knowing.
+priv let finished! id entry lines first_line recent s = {
+    history.record! entry
+    let command = Entry.command entry;
+    let exit = Entry.exit entry;
+    let learned = s |> State.set_entries (list.append (State.entries s) [entry])
+        |> State.set_predictor (predict.observe recent command (State.predictor s))
+        |> State.set_stats (insights.add entry (State.stats s))
+        |> State.set_kinds (kinds_of [entry] |> map.fold (fn m k n -> map.update_strict 0 (fn x -> x + n) k m) (State.kinds s))
+        |> State.set_classifier (explain.learn (State.classifier s) lines exit)
+        |> State.set_since_training (State.since_training s + 1);
+    let fixes = if exit == 0 { [] } else { fix.correct command exit (State.programs learned) (State.kinds learned) };
+    let why = if exit == 0 { %{ "errors" => [], "warnings" => [], "causes" => [] } } else { explain.explain (State.classifier learned) lines exit };
+    let summary = if len lines > 30 { list.map (fn i -> first_line + i) (explain.summarize (State.classifier learned) lines 6) } else { [] };
+    let next = if State.ready learned {
+        list.map (fn p -> %{ "command" => list.head p, "p" => list.nth 1 p })
+            (predict.next (State.predictor learned) (list.append recent [command]) (Entry.cwd entry) (hour_now! ()) 5)
+    } else { [] };
+    backend.emit! (State.events learned) "insight" %{
+        "id" => id, "command" => command, "exit" => exit, "duration" => Entry.duration entry,
+        "fixes" => fixes,
+        "causes" => list.map (fn c -> c.["line" => first_line + c.["line"]]) why.["causes"],
+        "errors" => list.map (fn i -> first_line + i) why.["errors"],
+        "warnings" => list.map (fn i -> first_line + i) why.["warnings"],
+        "summary" => summary, "next" => next,
+    }
+    maybe_train! learned
+};
+
+/// Train the network again when enough has happened since it last was.
+priv let maybe_train! s = if not (State.train s) || State.training s || not (State.ready s)
+    || (Net.fitted (Predictor.net (State.predictor s)) != () && State.since_training s < 150) { s } else {
+    let me = self! ();
+    let entries = State.entries s;
+    spawn! $( { let net = predict.train! entries; strict! net; send! me [:trained, net]; () } )
+    let n = s |> State.set_training true |> State.set_since_training 0;
+    backend.emit! (State.events n) "model" (model_status n)
+    n
+};
+
+/// The Insights panel's contents.
+priv let insights_of s = {
+    let summary = insights.summary (State.entries s) (State.stats s);
+    summary.["workflows" => insights.workflows (State.entries s) 6].["model" => model_status s]
+};

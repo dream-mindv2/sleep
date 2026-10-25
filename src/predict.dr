@@ -1,0 +1,233 @@
+// What a person will type next, learned from what they have typed.
+//
+// Two models, each good where the other is not, and a blend of them:
+//
+// **An n-gram model of commands** (`std.ml.text.ngram`, order 3): what
+// followed the last one or two commands, the last time they were run. It
+// learns from one example -- run `make` then `./app` once and it already
+// expects `./app` after `make` -- and it is updated as each command finishes.
+// What it cannot do is generalize: a context it has never seen tells it
+// nothing but how common each command is.
+//
+// **A small network** (`std.ml.nn`, trained by `ml.fit!` in the background):
+// hashed features of the last two commands, their programs, the working
+// directory and the hour of the day, through a hidden layer, to a softmax
+// over the commands run most often. It generalizes -- in a directory like the
+// ones where `cargo test` is run, after a command like the ones before it --
+// but needs a few hundred examples, and is retrained only now and then.
+//
+// The blend weighs the network by how well it did on the examples it was not
+// trained on, so a network that has not learned anything is not listened to.
+//
+// **Completion** -- the grey text after the cursor -- is a different question:
+// not what comes next, but how what has been typed so far ends. The answer is
+// a command from the history that starts with it, ranked by the n-gram
+// model's opinion in this context, how often and how recently it was run.
+import std.list;
+import std.map;
+import std.math;
+import std.ml;
+import std.ml.data;
+import std.ml.nn;
+import std.ml.optim;
+import std.ml.text;
+import std.num;
+import std.path;
+import std.str;
+import std.tensor;
+import history.{Entry};
+import history;
+
+/// The commands a network chooses among: the most often run, at most this many.
+priv let classes = 48;
+/// The width the network's features are hashed into.
+priv let width = 256;
+
+/// A trained network, the commands its outputs stand for, and how often it
+/// was right on held-out examples.
+mapping Net {
+    fitted : :any = ()
+    vocabulary : [:string] = []
+    accuracy : :float = 0.0
+    examples : :integer = 0
+}
+
+/// Everything prediction knows.
+mapping Predictor {
+    ngram : text.Ngram = text.Ngram.new ()
+    counts : %{:string => :integer} = %{}
+    last_seen : %{:string => :integer} = %{}
+    seen : :integer = 0
+    net : Net = Net.new ()
+}
+
+/// A command as the models see it: whitespace made single, ends trimmed.
+let normal : :string -> :string;
+let normal c = str.join_str " " (list.filter (fn w -> w != "") (str.split " " (str.trim c)));
+
+/// The models learned from `entries`, oldest first; no network yet.
+let build : [Entry] -> Predictor;
+let build entries = {
+    let commands = list.filter (fn c -> c != "") (list.map (fn e -> normal (Entry.command e)) entries);
+    list.fold (fn p c -> observe_only c p) (Predictor.new () |> Predictor.set_ngram (text.ngram 3 (sessions entries))) commands
+};
+
+/// Commands split where more than half an hour passed between two, so the
+/// n-gram model does not learn that a morning follows the night before.
+priv let sessions entries = {
+    let rec go es last cur acc = match es {
+        [] => list.reverse (if cur == [] { acc } else { list.cons (list.reverse cur) acc }),
+        _ => {
+            let e = list.head es;
+            let c = normal (Entry.command e);
+            let gap = Entry.start e > 0 && last > 0 && Entry.start e - last > 1800000;
+            if c == "" { go (list.tail es) last cur acc }
+            else if gap { go (list.tail es) (Entry.start e) [c] (if cur == [] { acc } else { list.cons (list.reverse cur) acc }) }
+            else { go (list.tail es) (if Entry.start e > 0 { Entry.start e } else { last }) (list.cons c cur) acc }
+        },
+    };
+    go entries 0 [] []
+};
+
+priv let observe_only c p = {
+    let n = Predictor.seen p + 1;
+    p |> Predictor.set_counts (map.update_strict 0 (fn k -> k + 1) c (Predictor.counts p))
+      |> Predictor.set_last_seen ((Predictor.last_seen p).[c => n]) |> Predictor.set_seen n
+};
+
+/// The models after `command` was run following `before` (most recent last).
+let observe : [:string] -> :string -> Predictor -> Predictor;
+let observe before command p = {
+    let c = normal command;
+    if c == "" { p } else {
+        let context = list.drop (num.max 0 (len before - 2)) (list.map normal before);
+        observe_only c (Predictor.set_ngram (text.observe (Predictor.ngram p) (list.append context [c])) p)
+    }
+};
+
+// --- the network -------------------------------------------------------------------
+
+/// A moment's features: the last two commands and their programs, the
+/// directory's name, and the hour, as hashed text features.
+let features : [:string] -> :string -> :integer -> [:float];
+let features before cwd hour = {
+    let recent = list.reverse (list.take 2 (list.reverse before));
+    let p1 = if len recent >= 1 { list.last recent } else { "" };
+    let p2 = if len recent >= 2 { list.head recent } else { "" };
+    text.hashed width (list.concat [
+        ["p1:" + p1, "p2:" + p2, "h1:" + history.kind p1, "h2:" + history.kind p2, "d:" + path.basename cwd,
+         "t:" + to_string (hour / 3)],
+        list.map (fn w -> "w:" + w) (text.tokens p1),
+    ])
+};
+
+/// What a network is trained on: for each command among the vocabulary, the
+/// features of the moment before it, and which it was.
+priv let examples entries vocabulary = {
+    let index = map.from_pairs (list.map_indexed (fn i c -> [c, i]) vocabulary);
+    let commands = list.map (fn e -> normal (Entry.command e)) entries;
+    let rec go es before acc = match es {
+        [] => list.reverse acc,
+        _ => {
+            let e = list.head es;
+            let c = normal (Entry.command e);
+            let hour = if Entry.start e > 0 { (Entry.start e / 3600000) % 24 } else { 12 };
+            let next_acc = match index.[c else ()] {
+                () => acc,
+                i => if before == [] { acc } else { list.cons [features before (Entry.cwd e) hour, i] acc },
+            };
+            go (list.tail es) (list.drop (num.max 0 (len before - 1)) (list.append before [c])) next_acc
+        },
+    };
+    go entries [] []
+};
+
+/// A network trained on `entries`, or none when there are too few of them to
+/// learn from. Held-out examples (a fifth) measure it. Slow: run it in a
+/// process of its own.
+let train! : [Entry] -> Net;
+let train! entries = {
+    let counts = list.fold (fn m e -> map.update_strict 0 (fn n -> n + 1) (normal (Entry.command e)) m) map.empty entries;
+    let vocabulary = list.map list.head (list.take classes (list.sort_by (fn a b -> list.nth 1 a > list.nth 1 b)
+        (list.filter (fn p -> list.nth 1 p >= 2 && list.head p != "") (map.pairs counts))));
+    let ex = list.drop (num.max 0 (len (examples entries vocabulary) - 4000)) (examples entries vocabulary);
+    if len ex < 60 || len vocabulary < 3 { Net.new () |> Net.set_examples (len ex) } else {
+        let ds = data.of_lists (list.map list.head ex) (list.map (fn x -> list.nth 1 x) ex);
+        let [train_set, held] = data.split 0.8 7 ds;
+        let model = nn.sequential [nn.dense 64, nn.relu, nn.dense (len vocabulary)];
+        let fitted = ml.fit! model train_set (ml.Fit.new () |> ml.Fit.set_loss :cross_entropy
+            |> ml.Fit.set_optimizer (optim.adam 0.01) |> ml.Fit.set_epochs 40 |> ml.Fit.set_batch 64
+            |> ml.Fit.set_metrics [:accuracy] |> ml.Fit.set_patience 6 |> ml.Fit.set_validation held
+            |> ml.Fit.set_device :host |> ml.Fit.set_verbose false);
+        let score = (ml.evaluate fitted held).["accuracy" else 0.0];
+        Net.new () |> Net.set_fitted fitted |> Net.set_vocabulary vocabulary |> Net.set_accuracy score |> Net.set_examples (len ex)
+    }
+};
+
+/// The network's probability for each command it knows, at this moment.
+priv let net_scores net before cwd hour = if Net.fitted net == () { [] } else {
+    let row = tensor.to_list (ml.probabilities (Net.fitted net) (tensor.of_list [features before cwd hour]));
+    let flat = if row != [] && type_of (list.head row) == :list { list.head row } else { row };
+    list.zip (Net.vocabulary net) flat
+};
+
+// --- asking ------------------------------------------------------------------------
+
+/// The `k` commands most likely to be run next, `[command, probability]`.
+let next : Predictor -> [:string] -> :string -> :integer -> :integer -> [[:any]];
+let next p before cwd hour k = {
+    let context = list.map normal before;
+    let grams = text.predict (Predictor.ngram p) (list.drop (num.max 0 (len context - 2)) context);
+    let net = Predictor.net p;
+    let trust = num.clamp 0.0 0.6 (Net.accuracy net);
+    let from_net = net_scores net context cwd hour;
+    let blended = list.fold (fn m pair -> map.update_strict 0.0 (fn v -> v + trust * list.nth 1 pair) (list.head pair) m)
+        (list.fold (fn m pair -> map.update_strict 0.0 (fn v -> v + (1.0 - trust) * list.nth 1 pair) (list.head pair) m) map.empty grams)
+        from_net;
+    let last = if context == [] { "" } else { list.last context };
+    list.take k (list.sort_by (fn a b -> list.nth 1 a > list.nth 1 b)
+        (list.filter (fn pair -> list.head pair != last) (map.pairs blended)))
+};
+
+/// How `typed` most likely ends: the rest of a command from the history that
+/// starts with it, or `""`. Ranked by the n-gram model in this context, then
+/// by how often (log) and how recently each was run.
+let complete : Predictor -> [:string] -> :string -> :string;
+let complete p before typed = if str.trim typed == "" || str.length typed < 2 { "" } else {
+    let context = list.map normal before;
+    let grams = map.from_pairs (text.predict (Predictor.ngram p) (list.drop (num.max 0 (len context - 2)) context));
+    let seen = num.to_float (num.max 1 (Predictor.seen p));
+    let candidates = list.filter (fn c -> str.starts_with typed c && c != typed) (map.keys (Predictor.counts p));
+    let score = fn c -> 3.0 * grams.[c else 0.0] + 0.3 * math.log (1.0 + num.to_float ((Predictor.counts p).[c]))
+        + num.to_float ((Predictor.last_seen p).[c else 0]) / seen;
+    match candidates {
+        [] => "",
+        _ => {
+            let best = list.fold (fn b c -> if b == () || score c > score b { c } else { b }) () candidates;
+            str.slice (str.byte_length typed) (str.byte_length best - str.byte_length typed) best
+        },
+    }
+};
+
+when test {
+    import std.test;
+    let at = fn c -> Entry.new () |> Entry.set_command c;
+    let entries = list.map at ["cd app", "make", "./app", "git status", "make", "./app", "git status", "git commit -m x", "make", "./app"];
+    let tests = [
+        test.case "the n-gram model expects what followed before" $({
+            let p = build entries;
+            test.eq! "./app" (list.head (list.head (next p ["cd app", "make"] "/home/me/app" 10 3)))
+        }),
+        test.case "completion finishes a command from the history" $({
+            let p = build entries;
+            test.eq! ["status", "", "ke"] [complete p ["make", "./app"] "git ", complete p [] "zz", complete p [] "ma"]
+        }),
+        test.case "what is run is learned at once" $({
+            let p = list.fold (fn q i -> observe ["make"] "./run-tests" q) (build entries) (list.range 0 4);
+            test.eq! "./run-tests" (list.head (list.head (next p ["make"] "" 10 1)))
+        }),
+        test.case "a session ends after half an hour" $(test.eq! [["a", "b"], ["c"]]
+            (sessions [at "a" |> Entry.set_start 1000, at "b" |> Entry.set_start 2000, at "c" |> Entry.set_start 4000000])),
+        test.case "features have the network's width" $(test.eq! 256 (len (features ["ls"] "/tmp" 9))),
+    ];
+}

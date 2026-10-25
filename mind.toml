@@ -1,0 +1,14 @@
+# sleep: a terminal written in Dream. `mind run --desktop` opens it.
+[package]
+name = "sleep"
+version = "0.1.0"
+entry = "src/frontend.dr"
+description = "A terminal written in Dream: tabs, HTTP and database tabs, and an assistant that learns from your history"
+repository = "https://github.com/dream-mindv2/sleep"
+
+# The frontend is the window, on the browser VM; the backend is native and
+# owns the shells, the network and the databases.
+[graphics]
+frontend = "src/frontend.dr"
+backend = "src/backend.dr"
+js = ["web/sleep.mjs"]

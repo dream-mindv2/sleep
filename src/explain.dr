@@ -1,0 +1,256 @@
+// Why a command failed, and what to do about it.
+//
+// Three steps, each a small model:
+//
+// **Which lines matter.** A naive Bayes classifier (`std.ml.bayes`) reads
+// each line of output as its words and says `:error`, `:warning` or `:ok`.
+// It starts from a few dozen lines from compilers, package managers, git and
+// the shell, and learns from the person's own commands as they finish: the
+// lines of a failed command that match a known failure are errors, and the
+// last lines of one that succeeded are fine. Those lines are what the window
+// marks, and what the summary and the explanation are made of.
+//
+// **What they mean.** A table of the failures people meet most -- a port in
+// use, a missing module, a rejected push, no space left -- each with what
+// it means and the command that usually fixes it, found for a line by TF-IDF
+// similarity (`std.ml.text`) as well as by its exact text, so a message
+// worded a little differently from the one in the table is still known.
+//
+// **A summary.** For a long output, the few lines that say most: errors
+// first, then the lines least like the rest (the rare words of TF-IDF), then
+// the last line, in the order they were printed.
+import std.list;
+import std.map;
+import std.ml.bayes;
+import std.ml.text;
+import std.num;
+import std.regex;
+import std.str;
+
+/// What is known about a kind of failure: words that identify it, what it
+/// means, and a fix -- in which `{1}` is what the pattern's first group
+/// matched (a module's name, a port).
+mapping Known {
+    id : :string = ""
+    pattern : :string = ""
+    sample : :string = ""
+    meaning : :string = ""
+    fix : :string = ""
+    rx : :any = ()
+}
+
+/// An entry, its pattern compiled once.
+priv let k id pattern sample meaning fix = Known.new () |> Known.set_id id |> Known.set_pattern pattern
+    |> Known.set_sample sample |> Known.set_meaning meaning |> Known.set_fix fix
+    |> Known.set_rx (Result.unwrap_or () (regex.parse pattern));
+
+/// The failures the explainer knows.
+let known : [Known];
+let known = [
+    k "not-found" "command not found: ?([\\w.+-]+)|([\\w.+-]+): command not found" "bash: gti: command not found"
+        "The shell found no program by that name on your PATH." "",
+    k "no-such-file" "No such file or directory" "cat: notes.txt: No such file or directory"
+        "A path the command was given does not exist from here. Check the spelling and the working directory." "ls",
+    k "permission" "Permission denied|EACCES|Operation not permitted" "bash: ./deploy.sh: Permission denied"
+        "You are not allowed to do this to that file. A script may need to be made executable, or the command run as another user." "chmod +x {file}",
+    k "port-in-use" "(?:address already in use|EADDRINUSE)[^0-9]*(\\d+)?" "Error: listen EADDRINUSE: address already in use :::3000"
+        "Another process is already listening on that port." "lsof -i :{1}",
+    k "py-module" "No module named '?([\\w.]+)'?" "ModuleNotFoundError: No module named 'requests'"
+        "Python could not import a package: it is not installed in the environment this python uses." "python3 -m pip install {1}",
+    k "pip-managed" "externally-managed-environment" "error: externally-managed-environment"
+        "Your system's Python is managed by the OS package manager, which refuses pip installs. Use a virtual environment." "python3 -m venv .venv && . .venv/bin/activate",
+    k "node-module" "Cannot find module '([^']+)'" "Error: Cannot find module 'express'"
+        "Node could not find a package: dependencies are not installed, or the name is wrong." "npm install",
+    k "npm-eresolve" "ERESOLVE" "npm ERR! code ERESOLVE"
+        "npm found peer dependencies that conflict with each other." "npm install --legacy-peer-deps",
+    k "not-git" "not a git repository" "fatal: not a git repository (or any of the parent directories): .git"
+        "This directory is not inside a git repository." "git init",
+    k "git-rejected" "\\[rejected\\]|non-fast-forward|fetch first" "! [rejected]        main -> main (fetch first)"
+        "The remote has commits you do not have. Bring them in before pushing." "git pull --rebase",
+    k "git-conflict" "CONFLICT \\(|Merge conflict|fix conflicts" "CONFLICT (content): Merge conflict in src/app.rs"
+        "Both sides changed the same lines. Edit the marked files, then add them and continue." "git status",
+    k "git-upstream" "has no upstream branch" "fatal: The current branch feature has no upstream branch."
+        "This branch has not been pushed before, so git does not know where to push it." "git push -u origin HEAD",
+    k "git-uncommitted" "would be overwritten by (?:merge|checkout)|commit your changes or stash them" "error: Your local changes to the following files would be overwritten by checkout"
+        "You have changes that this would overwrite. Commit or stash them first." "git stash",
+    k "ssh-key" "Permission denied \\(publickey\\)" "git@github.com: Permission denied (publickey)."
+        "The server did not accept any of your SSH keys." "ssh-add -l",
+    k "resolve-host" "Could not resolve host|Name or service not known|getaddrinfo ENOTFOUND" "curl: (6) Could not resolve host: example.invalid"
+        "The host name could not be looked up: a typo, or no network." "ping -c 1 1.1.1.1",
+    k "refused" "Connection refused|ECONNREFUSED" "curl: (7) Failed to connect to localhost port 8080: Connection refused"
+        "Nothing is listening at that address and port. Is the server running?" "",
+    k "disk-full" "No space left on device|ENOSPC" "write error: No space left on device"
+        "The disk is full." "df -h",
+    k "too-many-files" "Too many open files|EMFILE" "Error: EMFILE: too many open files"
+        "The process hit its limit of open files." "ulimit -n 4096",
+    k "killed" "^Killed$|Out of memory|oom-kill" "Killed"
+        "The system stopped the process, usually because memory ran out." "free -h",
+    k "segfault" "Segmentation fault|SIGSEGV|core dumped" "Segmentation fault (core dumped)"
+        "The program crashed reading memory it should not have: a bug in it, or in a library it uses." "",
+    k "docker-daemon" "Cannot connect to the Docker daemon" "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"
+        "Docker's background service is not running, or you cannot reach it." "sudo systemctl start docker",
+    k "docker-perm" "permission denied while trying to connect to the Docker daemon" "Got permission denied while trying to connect to the Docker daemon socket"
+        "Your user is not allowed to use Docker's socket." "sudo usermod -aG docker $USER",
+    k "make-no-rule" "No rule to make target|No targets specified and no makefile found" "make: *** No rule to make target 'buidl'.  Stop."
+        "make has no target by that name here." "make -qp | grep -E '^[a-zA-Z0-9_-]+:' | head",
+    k "rust-error" "error\\[E\\d+\\]" "error[E0425]: cannot find value `x` in this scope"
+        "The Rust compiler refused the code; the lines after this say where and why." "cargo check",
+    k "linker" "undefined reference to|ld returned 1 exit status|Undefined symbols" "/usr/bin/ld: main.o: undefined reference to `foo'"
+        "Compiling worked, but linking did not find a function: a library is missing from the link, or a file was not compiled." "",
+    k "syntax" "SyntaxError|syntax error near|parse error" "SyntaxError: invalid syntax"
+        "The program's source could not be read: something is mistyped near the place shown." "",
+    k "sudo-needed" "are you root\\?|must be run as root|requires superuser" "E: Could not open lock file /var/lib/dpkg/lock-frontend - open (13: Permission denied) are you root?"
+        "This needs administrator rights." "sudo !!",
+    k "timeout" "timed out|ETIMEDOUT|deadline exceeded" "curl: (28) Operation timed out after 30001 milliseconds"
+        "The other side did not answer in time." "",
+    k "certificate" "certificate verify failed|self[- ]signed certificate|SSL certificate problem" "SSL certificate problem: self-signed certificate"
+        "The server's TLS certificate is not one your system trusts." "",
+    k "cuda" "CUDA out of memory|CUDA error" "RuntimeError: CUDA out of memory."
+        "The GPU ran out of memory. A smaller batch, or a smaller model, needs less." "nvidia-smi",
+    k "lockfile" "Could not get lock|database is locked|Another app is currently holding" "E: Could not get lock /var/lib/dpkg/lock-frontend"
+        "Another process holds a lock this one needs. Wait for it to finish." "",
+];
+
+/// The classifier's first examples: lines from tools people use, by class.
+priv let seed_lines = [
+    ["error: cannot find symbol", :error], ["fatal: not a git repository", :error], ["Error: Cannot find module 'x'", :error],
+    ["ModuleNotFoundError: No module named 'numpy'", :error], ["Traceback (most recent call last):", :error],
+    ["npm ERR! code ERESOLVE", :error], ["error[E0425]: cannot find value", :error], ["Segmentation fault (core dumped)", :error],
+    ["make: *** [Makefile:12: all] Error 1", :error], ["FAILED tests/test_app.py::test_login", :error],
+    ["Permission denied", :error], ["No such file or directory", :error], ["command not found", :error],
+    ["panic: runtime error: index out of range", :error], ["Exception in thread main java.lang.NullPointerException", :error],
+    ["undefined reference to main", :error], ["E: Unable to locate package", :error], ["failed to compile", :error],
+    ["Connection refused", :error], ["error: could not compile", :error], ["FAIL src/app.test.js", :error],
+    ["warning: unused variable", :warning], ["warning: deprecated", :warning], ["npm WARN deprecated", :warning],
+    ["DeprecationWarning: this will be removed", :warning], ["warning: implicit declaration of function", :warning],
+    ["WARN skipping optional dependency", :warning], ["warning: LF will be replaced by CRLF", :warning],
+    ["Compiling app v0.1.0", :ok], ["Finished release target in 3.2s", :ok], ["added 120 packages in 4s", :ok],
+    ["Successfully installed requests", :ok], ["All tests passed", :ok], ["test result: ok. 12 passed", :ok],
+    ["Already up to date.", :ok], ["Downloading packages", :ok], ["Building wheel for app", :ok], ["listening on port 3000", :ok],
+    ["total 48", :ok], ["drwxr-xr-x 2 me me 4096 Jan 1 src", :ok], ["On branch main", :ok], ["nothing to commit, working tree clean", :ok],
+    ["Running 3 tests", :ok], ["ok", :ok], ["Done in 2.1s", :ok],
+];
+
+/// A line's features: its words, plus whether it starts as errors do.
+let line_features : :string -> [:string];
+let line_features l = {
+    let words = text.tokens l;
+    let shape = list.filter (fn s -> s != "") [
+        if str.starts_with "E:" l || str.starts_with "error" (str.lower l) { "^error" } else { "" },
+        if str.contains_str "Error" l { "Error" } else { "" },
+        if str.starts_with "  " l { "^indent" } else { "" },
+    ];
+    list.append words shape
+};
+
+/// The classifier with its first examples.
+let classifier : bayes.Model;
+let classifier = bayes.fit (list.map (fn ex -> [line_features (list.head ex), list.nth 1 ex]) seed_lines);
+
+/// The class of each line, with its probability.
+let classify : bayes.Model -> :string -> [:any];
+let classify model l = match bayes.probabilities model (line_features l) { [] => [:ok, 1.0], ps => list.head ps };
+
+/// The model, having learned from a command that finished: the lines of a
+/// failure that a known failure matches are errors; the last few lines of a
+/// success are fine.
+let learn : bayes.Model -> [:string] -> :integer -> bayes.Model;
+let learn model lines exit = if exit == 0 {
+    list.fold (fn m l -> bayes.learn (line_features l) :ok m) model (list.take 5 (list.reverse (list.filter (fn l -> str.trim l != "") lines)))
+} else {
+    list.fold (fn m l -> if match_known l != () { bayes.learn (line_features l) :error m } else { m }) model lines
+};
+
+/// The known failure a line is, with what its pattern caught: `[known,
+/// groups]`, or `()`.
+let match_known : :string -> :any;
+let match_known l = list.fold (fn found kn -> if found != () { found } else {
+    if Known.rx kn == () { () } else {
+        match regex.find (Known.rx kn) l {
+            () => (),
+            m => [kn, match regex.groups m { () => [], gs => list.filter (fn g -> g != () && g != "") gs }],
+        }
+    }
+}) () known;
+
+priv let index = text.index text.tokens (list.map (fn kn -> [Known.id kn, Known.sample kn + " " + Known.pattern kn]) known);
+
+/// The known failures most like a line, when no pattern matched it exactly.
+let similar : :string -> [:any];
+let similar l = list.filter (fn hit -> list.nth 1 hit > 0.35) (text.search index l 2);
+
+/// A fix with what the pattern caught put in.
+priv let filled fix groups = if groups == [] { str.replace "{1}" "" fix } else { str.replace "{1}" (list.head groups) fix };
+
+/// An explanation of output: `%{ "errors" => [line numbers], "warnings" =>
+/// [..], "causes" => [%{ "id", "line", "meaning", "fix" }] }`. Line numbers
+/// count from 0 within `lines`.
+let explain : bayes.Model -> [:string] -> :integer -> %{:string => :any};
+let explain model lines exit = {
+    let tagged = list.map_indexed (fn i l -> [i, l, if str.trim l == "" { [:ok, 1.0] } else { classify model l }]) lines;
+    let errors = list.filter (fn t -> list.head (list.nth 2 t) == :error && list.nth 1 (list.nth 2 t) > 0.6) tagged;
+    let warnings = list.filter (fn t -> list.head (list.nth 2 t) == :warning && list.nth 1 (list.nth 2 t) > 0.6) tagged;
+    let found = list.flat_map (fn t -> match match_known (list.nth 1 t) {
+        () => [],
+        [kn, groups] => [%{ "id" => Known.id kn, "line" => list.head t, "meaning" => Known.meaning kn, "fix" => filled (Known.fix kn) groups,
+            "exact" => true }],
+    }) tagged;
+    let near = if found != [] || exit == 0 { [] } else {
+        list.flat_map (fn t -> list.flat_map (fn hit -> {
+            let kn = list.find (fn x -> Known.id x == list.head hit) known;
+            [%{ "id" => Known.id kn, "line" => list.head t, "meaning" => Known.meaning kn, "fix" => filled (Known.fix kn) [], "exact" => false }]
+        }) (similar (list.nth 1 t))) errors
+    };
+    %{ "errors" => list.map list.head errors, "warnings" => list.map list.head warnings,
+       "causes" => list.take 3 (list.unique_on (fn c -> c.["id"]) (list.append found near)) }
+};
+
+/// At most `n` lines that say most of a long output, in their order: errors,
+/// then the rarest lines, then the last.
+let summarize : bayes.Model -> [:string] -> :integer -> [:integer];
+let summarize model lines n = {
+    let kept = list.filter (fn p -> str.trim (list.nth 1 p) != "") (list.map_indexed (fn i l -> [i, l]) lines);
+    if len kept <= n { list.map list.head kept } else {
+        let tf = text.fit_tfidf (list.map (fn p -> text.tokens (list.nth 1 p)) kept);
+        let score = fn p -> {
+            let [c, prob] = classify model (list.nth 1 p);
+            let rarity = list.fold (fn a w -> a + (text.Tfidf.idf tf).[w else 1.0]) 0.0 (text.tokens (list.nth 1 p))
+                / num.to_float (num.max 1 (len (text.tokens (list.nth 1 p))));
+            (if c == :error { 10.0 } else if c == :warning { 4.0 } else { 0.0 }) + rarity
+        };
+        let last = list.head (list.last kept);
+        let best = list.take (n - 1) (list.sort_by (fn a b -> score a > score b) (list.filter (fn p -> list.head p != last) kept));
+        list.sort (list.cons last (list.map list.head best))
+    }
+};
+
+when test {
+    import std.test;
+    let tests = [
+        test.case "error lines are told from the rest" $(test.eq! [:error, :warning, :ok]
+            [list.head (classify classifier "error: expected `;` after expression"),
+             list.head (classify classifier "warning: unused import"),
+             list.head (classify classifier "Finished dev target in 0.4s")]),
+        test.case "a known failure is explained, with what it caught" $({
+            let e = explain classifier ["Traceback (most recent call last):", "ModuleNotFoundError: No module named 'yaml'"] 1;
+            let cause = list.head e.["causes"];
+            test.eq! ["py-module", "python3 -m pip install yaml", 1] [cause.["id"], cause.["fix"], cause.["line"]]
+            test.true! (list.contains 1 e.["errors"])
+        }),
+        test.case "a port in use gives the port to look at" $({
+            let cause = list.head ((explain classifier ["Error: listen EADDRINUSE: address already in use :::3000"] 1).["causes"]);
+            test.eq! "lsof -i :3000" cause.["fix"]
+        }),
+        test.case "the model learns a failure's lines" $({
+            let m = learn classifier ["frobnicate: widget rejected the gizmo", "fatal: not a git repository"] 1;
+            test.eq! :error (list.head (classify m "fatal: not a git repository here"))
+        }),
+        test.case "a summary keeps the errors and the last line" $({
+            let lines = list.append (list.map (fn i -> "Compiling crate" + to_string i) (list.range 0 20))
+                ["error[E0308]: mismatched types", "Compiling more", "error: could not compile `app`"];
+            let s = summarize classifier lines 3;
+            test.eq! [20, 22] (list.filter (fn i -> i >= 20) s |> list.filter (fn i -> i != 21))
+            test.eq! 3 (len s)
+        }),
+    ];
+}

@@ -1,0 +1,191 @@
+// The database tab's backend: a connection to SQLite or PostgreSQL, its
+// schema, and SQL run against it.
+//
+// **Each connection is a process.** A connection belongs to the process
+// that opened it (`std.foreign`'s rule for SQLite's handle, and a socket's
+// for PostgreSQL's), so the tab's connection lives in a process of its own,
+// which the backend asks by message. A slow query then holds that process
+// and nothing else: the terminal next to it keeps typing.
+//
+// **Results are shown, not computed with**: every cell becomes text, `null`
+// stays a null, a blob is shown by its size, and a result is cut at the row
+// limit the tab asked for, saying it was.
+import std.error;
+import std.list;
+import std.map;
+import std.proc;
+import std.sql;
+import std.sql.sqlite;
+import std.sql.pg;
+import std.str;
+import std.time;
+
+/// What the tab connects to: `:sqlite` and a file (`":memory:"` for none),
+/// or `:postgres` and a URL or keyword string.
+let open! : :atom -> :string -> :process;
+let open! kind target = {
+    let me = self! ();
+    // Connected means answering: a driver may bind its library lazily, so a
+    // database that cannot be used fails here, where it is reported, rather
+    // than at the first query.
+    let db = spawn! $( {
+        match try! { let c = connect! kind target; let tables = schema! c; strict! tables; Result.ok c } catch e { Result.error (describe e) } {
+            Result.ok(conn) => { send! me [:opened, self! ()]; serve! conn },
+            Result.error(why) => send! me [:failed, self! (), why],
+        }
+        ()
+    } );
+    match proc.recv_where_within! (fn m -> match m { [:opened, p] => p == db, [:failed, p, _] => p == db, _ => false }) 20000 {
+        Result.ok([:opened, _]) => db,
+        Result.ok([:failed, _, why]) => raise! (error.new :db_error why),
+        _ => { proc.kill! db :timeout; raise! (error.new :db_error "the database did not answer within 20 seconds") },
+    }
+};
+
+priv let connect! kind target = match kind {
+    :sqlite => if target == ":memory:" { sqlite.memory! () } else { sqlite.open! target },
+    :postgres => pg.open! target,
+    _ => raise! (error.new :db_error "unknown kind of database"),
+};
+
+priv let describe e = if sql.is_sql_error e { sql.describe_error e } else { error.message e };
+
+/// The connection's process: a request at a time, until it is closed.
+priv let rec serve! conn = {
+    let m = recv! ();
+    if proc.is_call m {
+        let body = proc.call_body m;
+        match body {
+            [:close] => { try! { sql.close! conn } catch e { () }; proc.reply! m true; () },
+            _ => { proc.reply! m (answer! conn body); serve! conn },
+        }
+    } else { serve! conn }
+};
+
+priv let answer! conn body = match body {
+    [:schema] => try! { Result.ok (schema! conn) } catch e { Result.error (describe e) },
+    [:query, text, limit] => query! conn text limit,
+    _ => Result.error "unknown request",
+};
+
+/// A cell as the table shows it.
+priv let cell v = match type_of v {
+    :unit => (),
+    :string => v,
+    :integer => to_string v,
+    :float => to_string v,
+    :bool => if v { "true" } else { "false" },
+    _ => match v { [:blob, bytes] => "<" + to_string (str.byte_length bytes) + " bytes>", _ => to_string v },
+};
+
+/// A query's rows as maps from column name to value. `sql.query!` keys a
+/// column by an atom when the program has one of that name, so which key
+/// reads `name` depends on the rest of the program; here it is always text.
+priv let named_rows! conn text = {
+    let o = sql.run! conn (sql.raw text);
+    let columns = o.[:columns else []];
+    list.map (fn r -> map.from_pairs (list.zip columns r)) (o.[:rows else []])
+};
+
+/// The tables and views, each with its columns and their types.
+priv let schema! conn = match sql.dialect_name (sql.dialect_of conn) {
+    :sqlite => {
+        let tables = named_rows! conn ("SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name");
+        list.map (fn row -> {
+            let name = row.["name"];
+            let cols = named_rows! conn ("PRAGMA table_info(\"" + str.replace "\"" "\"\"" name + "\")");
+            %{ "name" => name, "kind" => row.["type"],
+               "columns" => list.map (fn c -> %{ "name" => c.["name"], "type" => cell c.["type"], "key" => c.["pk" else 0] != 0 }) cols }
+        }) tables
+    },
+    _ => {
+        let cols = named_rows! conn ("SELECT c.table_schema, c.table_name, c.column_name, c.data_type, t.table_type FROM information_schema.columns c JOIN information_schema.tables t ON t.table_schema = c.table_schema AND t.table_name = c.table_name WHERE c.table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY c.table_schema, c.table_name, c.ordinal_position");
+        let grouped = list.fold (fn m row -> {
+            let name = if row.["table_schema"] == "public" { row.["table_name"] } else { row.["table_schema"] + "." + row.["table_name"] };
+            map.update_strict [] (fn cs -> list.cons [row.["column_name"], cell row.["data_type"], row.["table_type"]] cs) name m
+        }) map.empty cols;
+        list.map (fn p -> {
+            let cs = list.reverse (list.nth 1 p);
+            %{ "name" => list.head p, "kind" => if list.nth 2 (list.head cs) == "VIEW" { "view" } else { "table" },
+               "columns" => list.map (fn c -> %{ "name" => list.head c, "type" => list.nth 1 c, "key" => false }) cs }
+        }) (map.sorted_pairs grouped)
+    },
+};
+
+/// The statements of a script: split at semicolons that end a line, which
+/// is how a person writes several in an editor.
+let statements : :string -> [:string];
+let statements text = list.filter (fn s -> str.trim s != "") (list.map str.trim (str.split ";\n" (str.trim (str.trim_suffix ";" (str.trim text)))));
+
+/// Run each statement; the last one's rows (at most `limit`) are the result.
+priv let query! conn text limit = {
+    let started = time.monotonic! ();
+    let run_all = try! {
+        let outcomes = list.map (fn st -> { let o = sql.run! conn (sql.raw st); strict! o; o }) (statements text);
+        strict! outcomes
+        Result.ok outcomes
+    } catch e { Result.error (describe e) };
+    let ms = (time.monotonic! () - started) / 1000000;
+    match run_all {
+        Result.error(why) => Result.error why,
+        Result.ok([]) => Result.ok %{ "columns" => [], "rows" => [], "changes" => 0, "ms" => ms, "truncated" => false, "statements" => 0 },
+        Result.ok(outcomes) => {
+            let last = list.last outcomes;
+            let columns = last.[:columns else []];
+            let rows = last.[:rows else []];
+            let shown = list.take limit rows;
+            Result.ok %{
+                "columns" => columns,
+                "rows" => list.map (fn r -> list.map cell (if type_of r == :list { r } else { list.map (fn c -> r.[c else ()]) columns })) shown,
+                "changes" => list.fold (fn a o -> a + o.[:changes else 0]) 0 outcomes,
+                "ms" => ms, "truncated" => len rows > limit, "total" => len rows, "statements" => len outcomes,
+            }
+        },
+    }
+};
+
+/// The schema, by asking the connection's process.
+let schema_of! : :process -> Result :any :string;
+let schema_of! db = match try! { proc.call_within! db [:schema] 30000 } catch e { Result.error (lost e) } {
+    Result.ok(r) => r,
+    Result.error(why) => Result.error (if why == :timeout { "the database did not answer within 30 seconds" } else { why }),
+};
+
+/// Why a connection's process is gone, from the error a call to it raised.
+priv let lost e = if error.kind e == :down { "the connection was lost: " + to_string (error.payload e) } else { error.message e };
+
+/// Run SQL by asking the connection's process; the rows shown at most `limit`.
+let run! : :process -> :string -> :integer -> Result :any :string;
+let run! db text limit = match try! { proc.call_within! db [:query, text, limit] 600000 } catch e { Result.error (lost e) } {
+    Result.ok(r) => r,
+    Result.error(why) => Result.error (if why == :timeout { "the query did not finish within 10 minutes" } else { why }),
+};
+
+/// Close the connection.
+let close! : :process -> :unit;
+let close! db = { try! { proc.call_within! db [:close] 5000 } catch e { Result.error :down }; () };
+
+when test {
+    import std.test;
+    let tests = [
+        test.case "a script is its statements" $(test.eq! ["select 1", "select 2;x"] (statements "select 1;\n  select 2;x;\n")),
+        test.case "an in-memory SQLite database answers" $(if not (sqlite.available! ()) { test.true! true } else {
+            let db = open! :sqlite ":memory:";
+            let made = run! db "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);\nINSERT INTO t (name) VALUES ('a'), ('b'), (NULL);\nSELECT * FROM t ORDER BY id" 2;
+            let schema = schema_of! db;
+            close! db
+            match [made, schema] {
+                [Result.ok(r), Result.ok(tables)] => test.eq! [["id", "name"], [["1", "a"], ["2", "b"]], true, 3, "t", [true, false]]
+                    [r.["columns"], r.["rows"], r.["truncated"], r.["total"], (list.head tables).["name"],
+                     list.map (fn c -> c.["key"]) (list.head tables).["columns"]],
+                other => test.fail! other,
+            }
+        }),
+        test.case "a bad statement is an answer, not a failure" $(if not (sqlite.available! ()) { test.true! true } else {
+            let db = open! :sqlite ":memory:";
+            let r = run! db "SELEC 1" 10;
+            close! db
+            test.true! (Result.is_error r)
+        }),
+    ];
+}
