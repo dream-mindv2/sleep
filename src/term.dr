@@ -989,8 +989,10 @@ priv let blank_in cols p = if bg_of p == 0 { empty_row } else { blank cols p };
 /// `\r\n`. `[row, pen, last, next]`, `last` the last character written, or
 /// `()` where the line is anything else.
 //
-// Each kind of piece is a function of its own, and none binds a name in a
-// branch: the JIT takes a function only when each of its slots is bound once.
+// Each kind of piece is a function of its own, which reads as the parser
+// does. (It was first written so for the JIT, which until 2026-10-24 took no
+// function binding a name in two branches; "Bindings in scope" in
+// dream/docs/notes/vm-performance.md.)
 priv let rec flood_line d !i n cols !x !pen !last !row = if i >= n { () } else { flood_piece (str.byte i d) d i n cols x pen last row };
 
 priv let flood_piece b d i n cols x pen last row =

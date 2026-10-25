@@ -323,10 +323,9 @@ below).
    at a time. Around it: frames carry only the screen while output streams
    (`session.dr`), the widget draws lines in lazy blocks, and JSON is the
    VM's (`vm.json_encode`, `vm.json_decode`). "A stream of output" in
-   dream/docs/notes/browser-vm.md. Not done: the JIT refuses a function that
-   binds one slot twice, which the compiler does for `let`s in two branches;
-   the hot functions were reshaped around it, and fixing it in the JIT
-   would help everything.
+   dream/docs/notes/browser-vm.md. The JIT then refused any function binding
+   one slot in two branches; that is fixed in the VM ("Bindings in scope"
+   in dream/docs/notes/vm-performance.md), a self-compile 6% faster.
 9. **Done.** Publishing, as the user asked:
    - Commit and push `dream` and `mind/std` in their own repos.
    - Create `dream-mindv2/sleep`, which needs the user's go-ahead because
