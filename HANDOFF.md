@@ -249,7 +249,7 @@ below).
   - `fix.dr`: noisy-channel typo correction with OSA distance.
   - `explain.dr`: the naive Bayes classifier, the table of known failures,
     and the summary.
-  - `cookbook.dr`: about 100 recipes, retrieved by TF-IDF, with slots.
+  - `cookbook.dr`: about 550 recipes, retrieved by TF-IDF, with slots.
   - `risk.dr`: a logistic over regex features, with "allowed twice" trust.
   - `insights.dr`: durations as an EMA, workflows by k-means, and stats.
 - **Shared by both sides:** `settings.dr` (`Settings` as JSON, actions and

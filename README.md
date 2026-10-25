@@ -65,7 +65,7 @@ off in Settings.
 | **Ghost text** | the end of what you are typing, from your history, ranked by the n-gram model in this context, how often and how recently; → accepts it | completion is a different question from prediction: how this line ends, not what comes next |
 | **Did you mean** | a noisy-channel corrector: the program you meant is the one that makes `P(meant) × P(typed \| meant)` largest, edits counted with swapped neighbours as one (`gti` → `git`), subcommands too (`git psuh`) | `P(meant)` is learned from what you run, so it corrects towards your tools, not a dictionary's |
 | **Why it failed** | a naive Bayes classifier marks the output lines that matter; a table of common failures, matched by pattern and by TF-IDF similarity, says what they mean and the usual fix | naive Bayes learns one example at a time from your own failures, and its answers can be explained; similarity finds a failure worded a little differently from the table's |
-| **Ask** | "find files bigger than 100 MB": about a hundred recipes, retrieved by TF-IDF over words and character trigrams, with the holes -- sizes, ports, names, branches -- filled from the question | retrieval over a cookbook answers with a command you can read before running; it never runs anything |
+| **Ask** | "find files bigger than 100 MB": about 550 recipes -- files, text, git, containers, networking, packages for every system NixOS included, languages, Dream itself -- retrieved by TF-IDF over words and character trigrams, with the holes -- sizes, ports, names, branches -- filled from the question | retrieval over a cookbook answers with a command you can read before running; it never runs anything |
 | **Risk guard** | Enter on `rm -rf ~` or `git push --force origin main` asks first, with the reasons: a logistic model over what the command is, what it is aimed at and how it is run | the weights are set by hand, the honest choice for a model whose positive examples are disasters; a command you allow twice is trusted from then on |
 | **Insights** | what you run, what fails, where the time goes; your workflows, found by spherical k-means over the commands, and how long each kind of command usually takes | a workflow is a cluster: no one has to declare it |
 
@@ -81,12 +81,16 @@ From the workspace, with the VM and the compiler built (`just`):
 ```sh
 cd sleep
 DREAMS=$PWD/../build/dreams.dream DREAM=$PWD/../build-dream/bin/dream \
-    ../build-dream/bin/dream ../build/mind build      # target/debug/sleep
-../build-graphics/bin/dream --graphics target/debug/sleep
+    ../build-dream/bin/dream ../build/mind build      # target/debug/sleep.dream
+../build-graphics/bin/dream target/debug/sleep.dream
 ```
 
 The window needs the graphics VM (`just graphics-vm`, GTK and WebKitGTK).
-`mind run --desktop` builds and opens it in one step.
+`mind run --desktop` builds and opens it in one step; `mind install` installs
+it, and `dream -x sleep` opens it from then on. A new window's first tab
+starts in the directory sleep was started in, so a desktop's default terminal
+setting and a file manager's "Open Terminal Here" work as they do for any
+terminal.
 
 Each module's tests:
 

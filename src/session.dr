@@ -114,8 +114,15 @@ let start! : Start -> :any -> :any -> :process;
 let start! opts events assist = {
     let program = if Start.shell opts == "" { pty.shell! () } else { Start.shell opts };
     let [args, env] = if Start.integration opts { shell.prepare! program } else { [[], []] };
-    let dir = if Start.cwd opts != "" && io.is_dir! (Start.cwd opts) { Start.cwd opts }
-        else { match path.home! () { () => "", h => h } };
+    // A tab with no directory of its own starts where sleep was started, which
+    // is how a file manager's "Open Terminal Here" works: the launcher sets
+    // the working directory and nothing else. `/` is where a session service
+    // starts a program, not a place anyone asked for, so it means home.
+    let home = match path.home! () { () => "", h => h };
+    let dir = match Start.cwd opts {
+        "" => match os.cwd! () { "/" => home, d => if io.is_dir! d { d } else { home } },
+        d => if io.is_dir! d { d } else { home },
+    };
     let p = pty.spawn! (pty.Options.new () |> pty.Options.set_program program |> pty.Options.set_args args
         |> pty.Options.set_env (list.append env ["COLORTERM=truecolor", "TERM_PROGRAM=sleep", "TERM_PROGRAM_VERSION=0.1.0"])
         |> pty.Options.set_dir dir |> pty.Options.set_cols (Start.cols opts) |> pty.Options.set_rows (Start.rows opts));
