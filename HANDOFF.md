@@ -28,15 +28,13 @@ committing only when the user asks.
    cute or cool.
 8. PTY support may be added to std if needed. It was added.
 9. The old `sleep/` directory in the workspace, an unrelated sleep-lab demo,
-   was removed at the user's request: `git rm -r sleep`, staged and not
-   committed. The new app lives at `sleep/` and is meant to become a
-   submodule backed by `github.com/dream-mindv2/sleep`, which does not exist
-   yet.
+   was removed at the user's request. The new app lives at `sleep/`, a
+   submodule backed by `github.com/dream-mindv2/sleep`.
 
-Nothing is committed yet: not in `dream`, not in `mind/std`, not in the
-workspace, and not in `sleep`. `sleep/` is a fresh `git init` with no commits.
-Items 1-8 and 10 of the TODO below are done (2026-10-24); publishing (9)
-waits on the user.
+Everything is committed and pushed: `dream`, `mind/std`, `dreams` (the
+reseed), `sleep` at `github.com/dream-mindv2/sleep`, and the workspace with
+`sleep/` as a submodule. The TODO below is done (2026-10-24) but for the
+optional performance work.
 
 ## Current state: it works
 
@@ -287,7 +285,7 @@ below).
   Without it, the app now shows std's clear "cannot find the C library"
   error.
 
-## TODO: done 2026-10-24 but for publishing
+## TODO: done 2026-10-24
 
 1. **Done.** The stall is fixed (see above) and the tracing removed.
 2. **Done.** Ctrl+Enter is handled in `frontend.dr`'s `Msg.key` for the
@@ -320,7 +318,7 @@ below).
    the take-updates walk, and `scroll_up`. A full-width row also costs a
    wide line's copies even for a short line. Rows that hold only their
    `used` cells would make printing at a line's end an in-place push.
-9. Publishing, only when the user says to commit:
+9. **Done.** Publishing, as the user asked:
    - Commit and push `dream` and `mind/std` in their own repos.
    - Create `dream-mindv2/sleep`, which needs the user's go-ahead because
      it's outward-facing (`gh repo create dream-mindv2/sleep --public`).
