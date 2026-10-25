@@ -71,7 +71,9 @@ __sleep_precmd() {
   local s=$?
   if [[ $__sleep_ran == 1 ]]; then print -n \"\\e]133;D;$s\\a\"; __sleep_ran=0; fi
   print -n \"\\e]7;file://${HOST:-localhost}$PWD\\a\\e]133;A\\a\"
-  [[ $PS1 == *'133;B'* ]] || PS1=\"$PS1%{\\e]133;B\\a%}\"
+  # $'..', not \"..\": zsh's double quotes and its prompt expansion leave
+  # \\e as two characters, which the prompt then shows.
+  [[ $PS1 == *'133;B'* ]] || PS1=\"$PS1%{\"$'\\e]133;B\\a'\"%}\"
 }
 __sleep_preexec() {
   __sleep_ran=1

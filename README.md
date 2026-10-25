@@ -82,10 +82,11 @@ From the workspace, with the VM and the compiler built (`just`):
 cd sleep
 DREAMS=$PWD/../build/dreams.dream DREAM=$PWD/../build-dream/bin/dream \
     ../build-dream/bin/dream ../build/mind build      # target/debug/sleep.dream
-../build-graphics/bin/dream target/debug/sleep.dream
+../build-dream/bin/dream target/debug/sleep.dream
 ```
 
-The window needs the graphics VM (`just graphics-vm`, GTK and WebKitGTK).
+The window needs WebKitGTK 4.1 and GTK 3 installed, which the VM finds when
+it opens one (`nix profile install nixpkgs#webkitgtk_4_1` on Nix).
 `mind run --desktop` builds and opens it in one step; `mind install` installs
 it, and `dream -x sleep` opens it from then on. A new window's first tab
 starts in the directory sleep was started in, so a desktop's default terminal

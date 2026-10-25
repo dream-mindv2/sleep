@@ -133,7 +133,8 @@ below).
 - Built with no warnings:
   - native: `nix-shell -p llvm --run 'just vm'`
   - browser: `nix-shell -p emscripten cmake --run 'cmake --build build-browser -j16'`
-  - graphics: `nix-shell mind/std/graphics/shell.nix --run 'just graphics-vm'`
+  - graphics: every Linux VM since GTK and WebKitGTK are found at run time
+    (dream/src/graphics_api.hpp); the native build is the graphics build
 
 ### mind/std
 - **`src/pty.dr`** (new): `std.pty`. `Options`, `Pty`, `Exit`, `spawn!`,
@@ -269,7 +270,8 @@ below).
 - **Build:** from `sleep/`, run
   `DREAMS=$PWD/../build/dreams.dream DREAM=$PWD/../build-dream/bin/dream ../build-dream/bin/dream ../build/mind build`.
   It writes `target/debug/sleep/`.
-- **Window:** `build-graphics/bin/dream --graphics sleep/target/debug/sleep`.
+- **Window:** `build-dream/bin/dream sleep/target/debug/sleep.dream` (WebKitGTK
+  4.1 installed, or `DREAM_LIB_WEBKIT2GTK` naming it).
 - **Headless screenshots:** `scratchpad/shot.sh`. It runs Xvfb `:77`, uses
   xdotool for input and ImageMagick `import` for screenshots, and needs
   `nix-shell -p xdotool imagemagick` plus a sandbox-free shell.

@@ -82,6 +82,10 @@ mapping State {
     assist : :any = ()
     phase : Phase = Phase.idle
     integrated : :bool = false
+    // When the shell was given the integration, the monotonic millisecond
+    // until which the queue waits for its first prompt mark rather than
+    // guessing; 0 for a shell that will send none.
+    marks_due : :integer = 0
     pending : :bool = false
     due : :integer = 0
     streamed : :bool = false
@@ -131,7 +135,8 @@ let start! opts events assist = {
     let state = State.new () |> State.set_id (Start.id opts) |> State.set_pty p |> State.set_events events |> State.set_assist assist
         |> State.set_t (term.new (Start.cols opts) (Start.rows opts) (Start.scrollback opts))
         |> State.set_autosuggest (Start.autosuggest opts) |> State.set_risk_guard (Start.risk_guard opts) |> State.set_cwd dir
-        |> State.set_queue (Start.queue opts);
+        |> State.set_queue (Start.queue opts)
+        |> State.set_marks_due (if args == [] && env == [] { 0 } else { clock_ms! () + marks_wait });
     let session = spawn! $( guarded! state );
     let reader = spawn! $( read_loop! p session );
     session
@@ -298,15 +303,24 @@ priv let write! data force s = {
     }
 };
 
+/// How long a shell given the integration has to show its first prompt
+/// before the queue stops waiting for the mark and goes by the foreground.
+priv let marks_wait = 5000;
+
 /// The next queued command, typed, when the shell is waiting for one: at its
 /// prompt with nothing typed, or -- with no integration to say -- when the
-/// shell itself is in the foreground again.
+/// shell itself is in the foreground again. A shell that was given the
+/// integration is in the foreground long before it is waiting -- zsh reads
+/// its .zshrc there -- and what is typed then is echoed by the terminal and
+/// again by the line editor, so it is waited for, unless its marks never
+/// come (an rc file that replaces the hooks).
 priv let run_queue! s = match State.queue s {
     [] => s,
     [next, ..rest] => {
         let ready = if State.integrated s {
             match State.phase s { Phase.prompt(_, _) => typed_now s == "", _ => false }
-        } else { match try! { pty.foreground! (State.pty s) } catch e { Option.none } {
+        } else if clock_ms! () < State.marks_due s { false }
+        else { match try! { pty.foreground! (State.pty s) } catch e { Option.none } {
             Option.some(group) => group == pty.Pty.pid (State.pty s), Option.none => false } };
         if not ready { s } else {
             try! { pty.write! (State.pty s) (next + "\r") } catch e { () }
