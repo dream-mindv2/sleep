@@ -26,8 +26,11 @@ import std.proc;
 import std.registry;
 import std.str;
 import std.vm;
+import std.agent;
 import assist;
 import databases;
+import launch;
+import launch.{Launch};
 import requests;
 import session;
 import settings.{Settings};
@@ -68,6 +71,9 @@ let commands! events = {
     let session_of! = fn id -> registry.whereis! reg ("term:" + id);
     let db_of! = fn tab -> registry.whereis! reg ("db:" + tab);
     let tell! = fn id msg -> match session_of! id { () => false, pid => { send! pid msg; true } };
+    // What sleep was started to run (`-e`, `--workdir`), handed to the first
+    // tab that opens and to no other.
+    let started = agent.start! (launch.parse (os.args! ()));
     %{
         "settings_load" => backend.command! :any :any (fn v -> settings.encode (load_settings! ())),
         "settings_save" => backend.command! :any :bool (fn v -> {
@@ -81,9 +87,12 @@ let commands! events = {
         "term_open" => backend.command! :any :any (fn v -> {
             let s = load_settings! ();
             let id = "t" + to_string (vm.unique! ());
+            let first = agent.get_and_update! started (fn l -> [l, Launch.new ()]);
+            let cwd = match text_field v "cwd" { "" => Launch.dir first, d => d };
             let opts = session.Start.new () |> session.Start.set_id id
+                |> session.Start.set_queue (match Launch.command first { "" => [], c => [c] })
                 |> session.Start.set_cols (int_field v "cols" 80 2 1000) |> session.Start.set_rows (int_field v "rows" 24 1 500)
-                |> session.Start.set_cwd (text_field v "cwd") |> session.Start.set_shell (Settings.shell s)
+                |> session.Start.set_cwd cwd |> session.Start.set_shell (Settings.shell s)
                 |> session.Start.set_integration (Settings.integration s) |> session.Start.set_scrollback (Settings.scrollback s)
                 |> session.Start.set_autosuggest (Settings.autosuggest s) |> session.Start.set_risk_guard (Settings.risk_guard s);
             let pid = session.start! opts events helper;

@@ -1,0 +1,77 @@
+// What sleep was started to do: the command line a desktop hands a terminal.
+//
+// A desktop runs a program "in a terminal" -- KDE's Run in terminal, a
+// `.desktop` file's `Terminal=true`, xdg-terminal-exec -- by starting the
+// terminal with `-e` and the program after it, as xterm was. Some give the
+// program as one string (`-e "htop -d 5"`), most as its words (`-e htop -d
+// 5`), and a few say `--` instead; a directory comes as `--workdir DIR`, or as
+// the working directory and nothing at all.
+//
+// `std.cli` reads it. Everything after `-e` is the program's, whatever it looks
+// like, which is exactly what `--` means to `cli.parse`, so the first `-e` is
+// read as `--`. The options launchers add that sleep has no use for -- `--hold`,
+// `--title` -- are described so that they parse, and a line `cli.parse`
+// refuses all the same still has its program run.
+//
+// The command is put in the first tab's queue, not run in place of the shell:
+// it runs at the first prompt, as if typed, so its output stays in the tab's
+// history and the shell is still there when it ends.
+import std.cli;
+import std.list;
+
+/// What the command line asked for: a command for the first tab, and where
+/// to start it. Empty for neither.
+mapping Launch {
+    command : :string = ""
+    dir : :string = ""
+}
+
+/// The options a terminal is started with.
+let options : [cli.Option];
+let options = [
+    cli.value "w" "workdir" "DIR" "start the first tab in DIR",
+    cli.value "" "working-directory" "DIR" "the same",
+    cli.flag "" "hold" "keep the tab when the program ends (a tab always is kept)",
+    cli.value "T" "title" "TITLE" "the window's title (sleep names tabs itself)",
+];
+
+/// A program and its arguments as one line for a shell. One word is taken as
+/// a line already, which is what `-e "htop -d 5"` means.
+let command_line : [:string] -> :string;
+let command_line words = match words {
+    [one] => one,
+    _ => cli.shell_line words,
+};
+
+/// The command line, read.
+let parse : [:string] -> Launch;
+let parse args = {
+    let at = list.find_index (fn a -> a == "-e" || a == "--command") args;
+    let line = if at < 0 { args } else { list.append (list.take at args) (list.cons "--" (list.drop (at + 1) args)) };
+    match cli.parse options line {
+        Result.ok(c) => Launch.new () |> Launch.set_command (command_line (cli.rest c))
+            |> Launch.set_dir (cli.get (cli.get "" c "working-directory") c "workdir"),
+        Result.error(_) => Launch.new () |> Launch.set_command (command_line (list.drop 1 (list.drop_while (fn a -> a != "--") line))),
+    }
+};
+
+when test {
+    import std.test;
+    let tests = [
+        test.case "nothing asked is nothing to do" $(test.eq! ["", ""] [Launch.command (parse []), Launch.dir (parse [])]),
+        test.case "a program's words are its command line" $(test.eq! "htop -d 5" (Launch.command (parse ["-e", "htop", "-d", "5"]))),
+        test.case "one word is a line already" $(test.eq! "htop -d 5" (Launch.command (parse ["-e", "htop -d 5"]))),
+        test.case "a word a shell would split is quoted" $(test.eq! "vim 'my notes.txt'"
+            (Launch.command (parse ["-e", "vim", "my notes.txt"]))),
+        test.case "-- is -e" $(test.eq! "man ls" (Launch.command (parse ["--", "man", "ls"]))),
+        test.case "a directory, and a launcher's options, before the program" $( {
+            let l = parse ["--hold", "--workdir", "/tmp", "--title", "x", "-e", "top"];
+            test.eq! ["/tmp", "top"] [Launch.dir l, Launch.command l]
+        }),
+        test.case "the long directory spelling" $(test.eq! "/srv" (Launch.dir (parse ["--working-directory=/srv"]))),
+        test.case "everything after -e is the program's, options included" $(test.eq! "ls --workdir x"
+            (Launch.command (parse ["-e", "ls", "--workdir", "x"]))),
+        test.case "an option nobody described still runs the program" $(test.eq! "top"
+            (Launch.command (parse ["--class", "x", "-e", "top"]))),
+    ];
+}

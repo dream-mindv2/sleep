@@ -70,6 +70,8 @@ mapping Start {
     scrollback : :integer = 5000
     autosuggest : :bool = true
     risk_guard : :bool = true
+    // Commands to run at the first prompts: what sleep was started to run.
+    queue : [:string] = []
 }
 
 mapping State {
@@ -128,7 +130,8 @@ let start! opts events assist = {
         |> pty.Options.set_dir dir |> pty.Options.set_cols (Start.cols opts) |> pty.Options.set_rows (Start.rows opts));
     let state = State.new () |> State.set_id (Start.id opts) |> State.set_pty p |> State.set_events events |> State.set_assist assist
         |> State.set_t (term.new (Start.cols opts) (Start.rows opts) (Start.scrollback opts))
-        |> State.set_autosuggest (Start.autosuggest opts) |> State.set_risk_guard (Start.risk_guard opts) |> State.set_cwd dir;
+        |> State.set_autosuggest (Start.autosuggest opts) |> State.set_risk_guard (Start.risk_guard opts) |> State.set_cwd dir
+        |> State.set_queue (Start.queue opts);
     let session = spawn! $( guarded! state );
     let reader = spawn! $( read_loop! p session );
     session

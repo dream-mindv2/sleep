@@ -90,7 +90,10 @@ The window needs the graphics VM (`just graphics-vm`, GTK and WebKitGTK).
 it, and `dream -x sleep` opens it from then on. A new window's first tab
 starts in the directory sleep was started in, so a desktop's default terminal
 setting and a file manager's "Open Terminal Here" work as they do for any
-terminal.
+terminal. `dream -x sleep -e htop -d 5` (or `-- htop -d 5`) runs a program in
+the first tab, at its first prompt and as if typed, and `--workdir DIR`
+starts it in DIR: what a desktop's "Run in terminal" hands a terminal
+(`src/launch.dr`).
 
 Each module's tests:
 
