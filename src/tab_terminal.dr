@@ -37,6 +37,7 @@ mapping Model {
     opening : :bool = false
     lines : %{:integer => :any} = %{}
     first : :integer = 0
+    start : :integer = 0
     base : :integer = 0
     rows : :integer = 24
     cols : :integer = 80
@@ -138,9 +139,20 @@ priv let set_moment name until m = if name == "none" || name == "" { m } else {
 };
 
 /// A frame from the session: its lines put in, the oldest dropped.
+///
+/// While output streams the session sends only the screen, and the lines
+/// that scrolled past above it come later, together. So the lines held may
+/// not reach back unbroken: `start` is where the run of them that ends at the
+/// screen begins -- a frame whose first line is past the last screen's foot
+/// begins one -- and the view draws from there, rather than a page of
+/// lines it does not have, numbered afresh each frame.
 priv let apply_screen v m = {
     let reset = v.["reset" else false];
     let base = v.["base" else 0];
+    let start = match v.["lines" else []] {
+        [] => Model.start m,
+        [[low, _], ..] => if low > Model.base m + Model.rows m { low } else { num.min (Model.start m) low },
+    };
     let kept = if reset { map.filter (fn n l -> n < base) (Model.lines m) } else { Model.lines m };
     let with_lines = list.fold (fn acc nl -> acc.[list.head nl => list.nth 1 nl]) kept (v.["lines" else []]);
     let total = base + v.["rows" else 24];
@@ -148,7 +160,7 @@ priv let apply_screen v m = {
     let trimmed = if map.size with_lines > keep + 200 { map.filter (fn n l -> n >= floor) with_lines } else { with_lines };
     let marks = list.fold (fn acc mk -> acc.[list.head mk => match list.nth 1 mk { "ok" => :ok, "error" => :error, _ => :running }])
         (if v.["first" else 0] > Model.first m { map.filter (fn n k -> n >= floor) (Model.marks m) } else { Model.marks m }) (v.["marks" else []]);
-    m |> Model.set_lines trimmed |> Model.set_first floor |> Model.set_base base |> Model.set_rows (v.["rows" else 24])
+    m |> Model.set_lines trimmed |> Model.set_first floor |> Model.set_start start |> Model.set_base base |> Model.set_rows (v.["rows" else 24])
       |> Model.set_cols (v.["cols" else 80]) |> Model.set_cursor (v.["cursor" else ()]) |> Model.set_cursor_visible (v.["cursor_visible" else true])
       |> Model.set_shape (v.["cursor_shape" else "block"]) |> Model.set_app_cursor (v.["app_cursor" else false])
       |> Model.set_bracketed (v.["bracketed" else false]) |> Model.set_alt (v.["alt" else false]) |> Model.set_marks marks
@@ -295,7 +307,7 @@ let ticking m = Model.running m != () || Model.moment m != "";
 
 priv let shown_lines m = {
     let total = Model.base m + Model.rows m;
-    let from = if Model.alt m { Model.base m } else { num.max (Model.first m) (total - keep) };
+    let from = if Model.alt m { Model.base m } else { num.min (Model.base m) (num.max (Model.start m) (num.max (Model.first m) (total - keep))) };
     [from, list.map (fn n -> (Model.lines m).[n else []]) (list.range from total)]
 };
 
@@ -414,6 +426,13 @@ when test {
         test.case "a frame puts its lines in by number" $({
             let m = apply_screen %{ "lines" => [[3, [["$ ls", "", "", 0]]]], "base" => 2, "rows" => 4, "cursor" => [3, 4], "marks" => [[3, "ok"]] } (new "a" "");
             test.eq! [[["$ ls", "", "", 0]], [3, 4], :ok] [(Model.lines m).[3], Model.cursor m, (Model.marks m).[3]]
+        }),
+        test.case "lines that streamed past are not drawn until they come" $({
+            let screen = fn base -> list.map (fn n -> [n, [[to_string n, "", "", 0]]]) (list.range base (base + 2));
+            let m = apply_screen %{ "lines" => screen 0, "base" => 0, "rows" => 2 } (new "a" "");
+            let streamed = apply_screen %{ "lines" => screen 5000, "base" => 5000, "rows" => 2 } m;
+            let caught_up = apply_screen %{ "lines" => screen 4990, "base" => 5000, "rows" => 2 } streamed;
+            test.eq! [5000, 4990] [list.head (shown_lines streamed), list.head (shown_lines caught_up)]
         }),
         test.case "a reset forgets the screen but keeps the history" $({
             let m = apply_screen %{ "lines" => [[0, [["old", "", "", 0]]], [5, [["screen", "", "", 0]]]], "base" => 4, "rows" => 2 } (new "a" "");

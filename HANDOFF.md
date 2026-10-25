@@ -313,11 +313,20 @@ below).
    - `std.trunk` has a new test, for a slice that copies.
 7. Still to tell the user: one purity error makes every std macro report
    "cannot run macro". Not fixed here.
-8. Partly done. The trunk fixes cut the flood's allocation by a third. What
-   is left is in the emulator itself, about 450 reductions a line: `spans`,
-   the take-updates walk, and `scroll_up`. A full-width row also costs a
-   wide line's copies even for a short line. Rows that hold only their
-   `used` cells would make printing at a line's end an in-place push.
+8. **Done** (2026-10-24, after publishing). A 200,000-line flood is 0.54 s
+   in the window, where it had drawn 111,000 lines after 25 s; a coloured
+   one is 1.6 s where it was about 10. In the emulator: rows are runs, not
+   two full-width trunks; plain and coloured lines at the foot of the
+   screen are taken a run of lines at a time (`flood`); the terminal's
+   rarely changed modes are a record of their own, so each change copies
+   less; CSI dispatches on its final character; parameters are read a byte
+   at a time. Around it: frames carry only the screen while output streams
+   (`session.dr`), the widget draws lines in lazy blocks, and JSON is the
+   VM's (`vm.json_encode`, `vm.json_decode`). "A stream of output" in
+   dream/docs/notes/browser-vm.md. Not done: the JIT refuses a function that
+   binds one slot twice, which the compiler does for `let`s in two branches;
+   the hot functions were reshaped around it, and fixing it in the JIT
+   would help everything.
 9. **Done.** Publishing, as the user asked:
    - Commit and push `dream` and `mind/std` in their own repos.
    - Create `dream-mindv2/sleep`, which needs the user's go-ahead because

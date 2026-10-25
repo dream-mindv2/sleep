@@ -121,7 +121,9 @@ database connection. The frontend asks through commands; the backend answers,
 and pushes what happens -- output, blocks, a finished query -- as events.
 
 A terminal session feeds output to the emulator as it arrives and sends the
-window what changed at most every 8 ms. The reader waits for each piece to be
+window what changed at most every 8 ms -- while output streams, only the
+screen, and the history it scrolled past once it stops, so a flood is drawn
+as fast as the program writes it. The reader waits for each piece to be
 taken before reading the next, so a flood of output fills the kernel's buffer
 and the program writing it waits, as on any terminal, rather than queueing
 ahead of your Ctrl-C.
