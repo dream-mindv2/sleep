@@ -271,7 +271,7 @@ below).
   `DREAMS=$PWD/../build/dreams.dream DREAM=$PWD/../build-dream/bin/dream ../build-dream/bin/dream ../build/mind build`.
   It writes `target/debug/sleep/`.
 - **Window:** `build-dream/bin/dream sleep/target/debug/sleep.dream` (WebKitGTK
-  4.1 installed, or `DREAM_LIB_WEBKIT2GTK` naming it).
+  4.1 installed, or `DREAM_LIB_WEBKIT2GTK_4_1` naming it).
 - **Headless screenshots:** `scratchpad/shot.sh`. It runs Xvfb `:77`, uses
   xdotool for input and ImageMagick `import` for screenshots, and needs
   `nix-shell -p xdotool imagemagick` plus a sandbox-free shell.

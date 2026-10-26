@@ -13,3 +13,9 @@ repository = "https://github.com/dream-mindv2/sleep"
 frontend = "src/frontend.dr"
 backend = "src/backend.dr"
 js = ["web/sleep.mjs"]
+
+# The C libraries sleep needs where it runs: SQLite for the database tabs and
+# WebKitGTK for its window. mind warns when either is not found.
+[system]
+sqlite3 = { version = "0", apt = "libsqlite3-0", dnf = "sqlite-libs", pacman = "sqlite", zypper = "libsqlite3-0", brew = "sqlite", nix = "sqlite" }
+"webkit2gtk-4.1" = { version = "0", apt = "libwebkit2gtk-4.1-0", dnf = "webkit2gtk4.1", pacman = "webkit2gtk-4.1", zypper = "libwebkit2gtk-4_1-0", nix = "webkitgtk_4_1" }
