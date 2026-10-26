@@ -51,7 +51,7 @@ let kind command = {
 /// Where sleep keeps its data: `$XDG_DATA_HOME/sleep`, or `~/.local/share/sleep`.
 let data_dir! : :unit -> :string;
 let data_dir! u = {
-    let home = match path.home! () { () => "/tmp", h => h };
+    let home = match path.home! () { Option.none => "/tmp", Option.some(h) => h };
     let base = match os.env! "XDG_DATA_HOME" { () => path.join home ".local/share", "" => path.join home ".local/share", d => d };
     path.join base "sleep"
 };
@@ -74,12 +74,12 @@ priv let zsh_line l = if str.starts_with ": " l {
 /// (`#1700000000`) dates the command after it.
 let shell_history! : :unit -> [Entry];
 let shell_history! u = {
-    let home = match path.home! () { () => "", h => h };
+    let home = match path.home! () { Option.none => "", Option.some(h) => h };
     let candidates = list.filter (fn p -> p != "") [match os.env! "HISTFILE" { () => "", f => f },
         path.join home ".zsh_history", path.join home ".bash_history"];
     let read_one = fn p -> match file.read! p {
-        () => [],
-        text => {
+        Option.none => [],
+        Option.some(text) => {
             let lines = list.filter (fn l -> str.trim l != "") (str.lines text);
             let recent = list.drop (num.max 0 (len lines - 20000)) lines;
             if str.ends_with "zsh_history" p { list.map zsh_line recent } else {
@@ -120,8 +120,8 @@ let decode line = match json.decode line {
 /// sleep's own log, oldest first, the last 50,000 entries.
 let own! : :unit -> [Entry];
 let own! u = match file.read! (log_file! ()) {
-    () => [],
-    text => {
+    Option.none => [],
+    Option.some(text) => {
         let lines = str.lines text;
         list.flat_map (fn l -> match decode l { Option.some(e) => [e], Option.none => [] }) (list.drop (num.max 0 (len lines - 50000)) lines)
     },

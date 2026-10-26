@@ -38,14 +38,14 @@ import settings;
 
 /// Where settings are kept: `$XDG_CONFIG_HOME/sleep`, or `~/.config/sleep`.
 priv let config_file! u = {
-    let home = match path.home! () { () => "/tmp", h => h };
+    let home = match path.home! () { Option.none => "/tmp", Option.some(h) => h };
     let base = match os.env! "XDG_CONFIG_HOME" { () => path.join home ".config", "" => path.join home ".config", d => d };
     path.join (path.join base "sleep") "settings.json"
 };
 
 priv let load_settings! u = match file.read! (config_file! ()) {
-    () => Settings.new (),
-    text => match json.decode text { Result.ok(v) => settings.decode v, Result.error(_) => Settings.new () },
+    Option.none => Settings.new (),
+    Option.some(text) => match json.decode text { Result.ok(v) => settings.decode v, Result.error(_) => Settings.new () },
 };
 
 priv let save_settings! s = {

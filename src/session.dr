@@ -124,7 +124,7 @@ let start! opts events assist = {
     // is how a file manager's "Open Terminal Here" works: the launcher sets
     // the working directory and nothing else. `/` is where a session service
     // starts a program, not a place anyone asked for, so it means home.
-    let home = match path.home! () { () => "", h => h };
+    let home = match path.home! () { Option.none => "", Option.some(h) => h };
     let dir = match Start.cwd opts {
         "" => match os.cwd! () { "/" => home, d => if io.is_dir! d { d } else { home } },
         d => if io.is_dir! d { d } else { home },
@@ -258,7 +258,7 @@ priv let tick! s = {
 priv let poll! s = match try! { pty.foreground! (State.pty s) } catch e { Option.none } {
     Option.none => s,
     Option.some(pid) => {
-        let comm = match try! { file.read! ("/proc/" + to_string pid + "/comm") } catch e { () } { () => "", c => str.trim c };
+        let comm = match try! { file.read! ("/proc/" + to_string pid + "/comm") } catch e { Option.none } { Option.none => "", Option.some(c) => str.trim c };
         let cwd = if State.integrated s { State.cwd s } else { try! { io.read_link! ("/proc/" + to_string pid + "/cwd") } catch e { State.cwd s } };
         let title = if term.title (State.t s) != "" { term.title (State.t s) } else { comm };
         if title == State.title s && cwd == State.cwd s { s } else {

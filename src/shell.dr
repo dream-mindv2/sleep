@@ -122,8 +122,8 @@ priv let zsh_passthrough name = "ZDOTDIR=\"${SLEEP_USER_ZDOTDIR:-$HOME}\"\n[ -f 
 let directory! : :unit -> :string;
 let directory! u = {
     let cache = match os.env! "XDG_CACHE_HOME" {
-        () => path.join (match path.home! () { () => "/tmp", h => h }) ".cache",
-        "" => path.join (match path.home! () { () => "/tmp", h => h }) ".cache",
+        () => path.join (match path.home! () { Option.none => "/tmp", Option.some(h) => h }) ".cache",
+        "" => path.join (match path.home! () { Option.none => "/tmp", Option.some(h) => h }) ".cache",
         d => d,
     };
     path.join (path.join cache "sleep") "shell"
@@ -195,8 +195,8 @@ when test {
     };
     let marks_test = fn name -> test.case (name + ", where installed, marks every prompt and command and shows none of them") $(
         match path.find_program! name {
-            () => test.true! true,
-            program => {
+            Option.none => test.true! true,
+            Option.some(program) => {
                 let out = run_shell! program;
                 test.true! (list.all (fn m -> str.contains_str ("\u{1b}]133;" + m) out) ["A", "B", "C", "D;0"])
                 test.false! (str.contains_str "\\e]133" out || str.contains_str "\\033]133" out || str.contains_str "133;B\\a" out)
