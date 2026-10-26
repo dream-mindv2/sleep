@@ -15,8 +15,11 @@
 // file that sources `~/.bashrc` and then hooks `PROMPT_COMMAND` and `PS0`;
 // zsh with `ZDOTDIR` pointing at a directory whose files source the real
 // ones from the person's own `ZDOTDIR` and then add `precmd` and `preexec`
-// hooks. A shell this does not know -- fish, nushell, a plain `sh` -- runs as
-// it is, and the terminal works without blocks.
+// hooks; fish with `--init-command` sourcing a file that does the same with
+// its `fish_prompt`, `fish_preexec` and `fish_postexec` events. A shell this
+// does not know -- nushell, a plain `sh` -- runs as it is, and the terminal
+// works without blocks.
+import std.cli;
 import std.file;
 import std.list;
 import std.os;
@@ -24,13 +27,14 @@ import std.path;
 import std.str;
 
 /// The kinds of shell integration is written for.
-union Kind { bash, zsh, other }
+union Kind { bash, zsh, fish, other }
 
 /// Which kind of shell a program is, by its name.
 let kind_of : :string -> Kind;
 let kind_of program = match path.basename program {
     "bash" => Kind.bash,
     "zsh" => Kind.zsh,
+    "fish" => Kind.fish,
     _ => Kind.other,
 };
 
@@ -85,6 +89,31 @@ add-zsh-hook preexec __sleep_preexec
 fi
 ";
 
+/// The fish side: sourced by `--init-command`, after the person's config.
+let fish : :string;
+let fish = "# sleep: shell integration for fish, sourced after your own config.
+if not set -q __sleep_installed
+    set -g __sleep_installed 1
+    function __sleep_prompt --on-event fish_prompt
+        printf '\\e]7;file://%s%s\\a\\e]133;A\\a' (prompt_hostname) \"$PWD\"
+    end
+    function __sleep_preexec --on-event fish_preexec
+        set -l c (string replace -a '\\\\' '\\\\\\\\' -- $argv[1] | string replace -a ';' '\\x3b' | string join '\\x0a')
+        printf '\\e]633;E;%s\\a\\e]133;C\\a' \"$c\"
+    end
+    function __sleep_postexec --on-event fish_postexec
+        printf '\\e]133;D;%s\\a' $status
+    end
+    # The end of the prompt, where typing begins: after the person's own
+    # fish_prompt, whichever it is.
+    functions -q fish_prompt; and functions -c fish_prompt __sleep_user_prompt
+    function fish_prompt
+        functions -q __sleep_user_prompt; and __sleep_user_prompt
+        printf '\\e]133;B\\a'
+    end
+end
+";
+
 /// The other files of zsh's startup, each passing on to the person's own.
 priv let zsh_passthrough name = "ZDOTDIR=\"${SLEEP_USER_ZDOTDIR:-$HOME}\"\n[ -f \"$ZDOTDIR/" + name
     + "\" ] && . \"$ZDOTDIR/" + name + "\"\nZDOTDIR=\"" + "$SLEEP_ZDOTDIR\"\n";
@@ -122,18 +151,58 @@ let prepare! program = {
             let own = match os.env! "ZDOTDIR" { () => "", d => d };
             [["-i"], ["ZDOTDIR=" + z, "SLEEP_ZDOTDIR=" + z, "SLEEP_USER_ZDOTDIR=" + own]]
         },
+        Kind.fish => {
+            file.mkdir_all! dir
+            let rc = path.join dir "sleep.fish";
+            file.write! rc fish
+            [["-i", "--init-command", "source " + cli.shell_word rc], []]
+        },
         Kind.other => [[], []],
     }
 };
 
 when test {
+    import std.pty;
     import std.test;
-    let tests = [
-        test.case "shells are known by their names" $(test.eq! [Kind.bash, Kind.zsh, Kind.other]
-            [kind_of "/usr/bin/bash", kind_of "zsh", kind_of "/usr/bin/fish"]),
+    let units = [
+        test.case "shells are known by their names" $(test.eq! [Kind.bash, Kind.zsh, Kind.fish, Kind.other]
+            [kind_of "/usr/bin/bash", kind_of "zsh", kind_of "/usr/bin/fish", kind_of "nu"]),
         test.case "the integration marks a prompt, a command and its end" $({
             test.true! (str.contains_str "133;A" bashrc && str.contains_str "133;C" bashrc && str.contains_str "133;D" bashrc)
             test.true! (str.contains_str "add-zsh-hook preexec" zshrc)
+            test.true! (str.contains_str "fish_postexec" fish)
         }),
     ];
+
+    // Each shell this machine has, run as sleep runs it -- the integration
+    // prepared, on a terminal of its own -- in an empty home, so nobody's
+    // own configuration is in it, given a command and then `exit`. Every mark
+    // must arrive as an escape sequence, and none as text: zsh once showed
+    // `\e]133;B\a` at the end of every prompt, and a test that only read
+    // these strings could not see it.
+    let run_shell! = fn program -> {
+        let home = file.temp_dir! ();
+        let [args, env] = prepare! program;
+        let p = pty.spawn! (pty.Options.new () |> pty.Options.set_program program |> pty.Options.set_args args
+            |> pty.Options.set_env (list.append env ["HOME=" + home, "TERM=xterm-256color"])
+            |> pty.Options.set_dir home);
+        pty.write! p "echo hi\r"
+        pty.write! p "exit\r"
+        let out = pty.read_all! p;
+        strict! out
+        file.remove_all! home
+        out
+    };
+    let marks_test = fn name -> test.case (name + ", where installed, marks every prompt and command and shows none of them") $(
+        match path.find_program! name {
+            () => test.true! true,
+            program => {
+                let out = run_shell! program;
+                test.true! (list.all (fn m -> str.contains_str ("\u{1b}]133;" + m) out) ["A", "B", "C", "D;0"])
+                test.false! (str.contains_str "\\e]133" out || str.contains_str "\\033]133" out || str.contains_str "133;B\\a" out)
+                test.true! (str.contains_str "hi" out)
+            },
+        });
+    let shells = list.map marks_test ["bash", "zsh", "fish"];
+    let tests = list.append units shells;
 }
