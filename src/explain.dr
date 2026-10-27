@@ -197,8 +197,10 @@ let explain model lines exit = {
     }) tagged;
     let near = if found != [] || exit == 0 { [] } else {
         list.flat_map (fn t -> list.flat_map (fn hit -> {
-            let kn = list.find (fn x -> Known.id x == list.head hit) known;
-            [%{ "id" => Known.id kn, "line" => list.head t, "meaning" => Known.meaning kn, "fix" => filled (Known.fix kn) [], "exact" => false }]
+            match list.find (fn x -> Known.id x == list.head hit) known {
+                Option.some(kn) => [%{ "id" => Known.id kn, "line" => list.head t, "meaning" => Known.meaning kn, "fix" => filled (Known.fix kn) [], "exact" => false }],
+                Option.none => [],
+            }
         }) (similar (list.nth 1 t))) errors
     };
     %{ "errors" => list.map list.head errors, "warnings" => list.map list.head warnings,

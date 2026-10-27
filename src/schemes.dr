@@ -65,7 +65,7 @@ let all = [
 
 /// The scheme with this id, or the first.
 let find : :string -> Scheme;
-let find id = match list.find (fn x -> Scheme.id x == id) all { () => list.head all, x => x };
+let find id = match list.find (fn x -> Scheme.id x == id) all { Option.none => list.head all, Option.some(x) => x };
 
 /// The custom properties that apply a scheme to the window.
 let variables : Scheme -> %{:string => :string};

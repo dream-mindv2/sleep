@@ -86,8 +86,8 @@ let send! a = {
             Result.ok(resp) => {
                 let status = http.status resp;
                 let hop = %{ "url" => target, "method" => method, "status" => status, "ms" => ms, "headers" => http.Response.headers resp };
-                let location = http.header "location" resp;
-                if Ask.follow a && status >= 300 && status < 400 && location != () && n < Ask.max_redirects a {
+                let location = Option.unwrap_or "" (http.header "location" resp);
+                if Ask.follow a && status >= 300 && status < 400 && location != "" && n < Ask.max_redirects a {
                     let next = match url.parse target { Result.ok(base) => url.to_text (url.resolve base location), Result.error(_) => location };
                     let as_get = status == 303 || ((status == 301 || status == 302) && method == "POST");
                     let same = origin next == origin target;
@@ -109,13 +109,13 @@ let send! a = {
             let size = str.byte_length body;
             let shown = if size > max_body { str.slice 0 max_body body } else { body };
             let pretty = match http.content_type resp {
-                () => "",
-                ct => if str.contains_str "json" (str.lower ct) { match json.decode body { Result.ok(v) => json.pretty v, Result.error(_) => "" } } else { "" },
+                Option.none => "",
+                Option.some(ct) => if str.contains_str "json" (str.lower ct) { match json.decode body { Result.ok(v) => json.pretty v, Result.error(_) => "" } } else { "" },
             };
             %{ "ok" => true, "status" => http.status resp, "reason" => http.reason (http.status resp),
                "headers" => http.Response.headers resp, "body" => shown, "pretty" => pretty, "size" => size,
                "truncated" => size > max_body, "ms" => total, "hops" => hops, "url" => final,
-               "content_type" => match http.content_type resp { () => "", ct => ct } }
+               "content_type" => match http.content_type resp { Option.none => "", Option.some(ct) => ct } }
         },
     }
 };

@@ -106,7 +106,7 @@ let tab_id t = match t {
     Tab.preferences(id) => id,
 };
 
-priv let find_tab id m = list.find (fn t -> tab_id t == id) (Model.tabs m);
+priv let find_tab id m = Option.or_unit (list.find (fn t -> tab_id t == id) (Model.tabs m));
 priv let replace_tab t m = Model.set_tabs (list.map (fn x -> if tab_id x == tab_id t { t } else { x }) (Model.tabs m)) m;
 priv let active_tab m = find_tab (Model.active m) m;
 priv let active_terminal m = match active_tab m { Tab.terminal(x) => x, _ => () };
@@ -166,8 +166,8 @@ priv let run_db! id msg m = match find_tab id m {
 /// The terminal tab whose session is `session`.
 priv let tab_of_session session m = match list.find (fn t -> match t {
     Tab.terminal(x) => tab_terminal.Model.session x == session, _ => false }) (Model.tabs m) {
-    () => (),
-    t => tab_id t,
+    Option.none => (),
+    Option.some(t) => tab_id t,
 };
 
 // --- settings ------------------------------------------------------------------------
@@ -211,8 +211,8 @@ priv let act! action m = match action {
     "new_request" => { let [id, m1] = fresh_id "req" m; add_tab (Tab.request (tab_request.new id "")) m1 },
     "new_database" => { let [id, m1] = fresh_id "db" m; add_tab (Tab.database (tab_database.new id)) m1 },
     "open_settings" => match list.find (fn t -> match t { Tab.preferences(_) => true, _ => false }) (Model.tabs m) {
-        () => add_tab (Tab.preferences "settings") m,
-        t => switch_to! (tab_id t) m,
+        Option.none => add_tab (Tab.preferences "settings") m,
+        Option.some(t) => switch_to! (tab_id t) m,
     },
     "close_tab" => close! (Model.active m) m,
     "next_tab" => cycle! 1 m,

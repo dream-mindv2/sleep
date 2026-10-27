@@ -81,18 +81,18 @@ let bell_animations = [["none", "None"], ["ripple", "Ripple"], ["flash", "Flash"
 /// The chord for `action`: the person's, or its default.
 let chord_for : Settings -> :string -> :string;
 let chord_for s action = match (Settings.keys s).[action else ()] {
-    () => match list.find (fn a -> list.head a == action) actions { () => "", a => list.nth 1 a },
+    () => match list.find (fn a -> list.head a == action) actions { Option.none => "", Option.some(a) => list.nth 1 a },
     c => c,
 };
 
 /// The action a chord is bound to, or `""`.
 let action_for : Settings -> :string -> :string;
 let action_for s chord = match list.find (fn a -> keys.canonical (chord_for s (list.head a)) == chord) actions {
-    () => "",
-    a => list.head a,
+    Option.none => "",
+    Option.some(a) => list.head a,
 };
 
-priv let atom_of options default v = match list.find (fn o -> atom_text o == v) options { () => default, o => o };
+priv let atom_of options default v = match list.find (fn o -> atom_text o == v) options { Option.none => default, Option.some(o) => o };
 priv let atom_text a = match a { :dark => "dark", :light => "light", :auto => "auto", :block => "block", :bar => "bar", :underline => "underline", _ => "" };
 
 /// Settings as JSON.
