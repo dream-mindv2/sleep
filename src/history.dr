@@ -61,8 +61,8 @@ priv let log_file! u = path.join (data_dir! ()) "history.jsonl";
 /// A zsh history line, `: 1700000000:0;command` when extended, or plain.
 priv let zsh_line l = if str.starts_with ": " l {
     match str.split_once ";" l {
-        () => Entry.new () |> Entry.set_command l,
-        [stamp, command] => {
+        Option.none => Entry.new () |> Entry.set_command l,
+        Option.some([stamp, command]) => {
             let seconds = match num.parse_int (str.trim (list.head (str.split ":" (str.trim_prefix ": " stamp)))) { Option.none => 0, Option.some(n) => n };
             Entry.new () |> Entry.set_command command |> Entry.set_start (seconds * 1000)
         },

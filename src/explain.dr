@@ -167,8 +167,8 @@ let match_known : :string -> :any;
 let match_known l = list.fold (fn found kn -> if found != () { found } else {
     if Known.rx kn == () { () } else {
         match regex.find (Known.rx kn) l {
-            () => (),
-            m => [kn, match regex.groups m { () => [], gs => list.filter (fn g -> g != () && g != "") gs }],
+            Option.none => (),
+            Option.some(m) => [kn, list.flat_map (fn g -> match g { Option.some(t) if t != "" => [t], _ => [] }) (regex.groups m)],
         }
     }
 }) () known;

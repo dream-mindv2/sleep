@@ -117,7 +117,7 @@ let correct command exit programs kinds = {
                     [_, []] => [],
                     [subs, _] => {
                         let used = map.from_pairs (list.flat_map (fn p -> match str.split_once " " (list.head p) {
-                            [h, s] => if h == program { [[s, list.nth 1 p]] } else { [] }, _ => [] }) (map.pairs kinds));
+                            Option.some([h, s]) => if h == program { [[s, list.nth 1 p]] } else { [] }, _ => [] }) (map.pairs kinds));
                         let sub = list.head rest;
                         if list.contains sub subs || map.has sub used { [] } else {
                             list.map (fn g -> str.join_str " " (list.cons program (list.cons (list.head g) (list.tail rest))))

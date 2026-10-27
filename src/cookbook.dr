@@ -630,36 +630,32 @@ priv let index = text.index features (list.map_indexed (fn i rc -> [i, Recipe.as
 /// What a question says that a recipe can use.
 let slots : :string -> %{:string => :string};
 let slots q = {
+    // The first group of the pattern's first match, when it took part.
     let find_one = fn pattern -> match regex.parse_with [:ignore_case] pattern {
-        Result.ok(rx) => match regex.groups (regex.find rx q) { () => (), [] => (), gs => list.head gs },
-        Result.error(_) => (),
+        Result.ok(rx) => match Option.map regex.groups (regex.find rx q) { Option.some([Option.some(g), .._]) => Option.some g, _ => Option.none },
+        Result.error(_) => Option.none,
     };
-    let size = match find_one "(\\d+)\\s*(k|kb|m|mb|meg|megabytes?|g|gb|gigabytes?)\\b" {
-        () => (),
-        n => {
-            let unit = str.lower (match find_one "\\d+\\s*(k|kb|m|mb|meg|megabytes?|g|gb|gigabytes?)\\b" { () => "m", u => u });
-            n + (if str.starts_with "k" unit { "k" } else if str.starts_with "g" unit { "G" } else { "M" })
-        },
-    };
-    let quoted = match find_one "['\"`]([^'\"`]+)['\"`]" { () => (), x => x };
-    let ext = match find_one "\\.([a-zA-Z0-9]{1,6})\\b" {
-        () => match find_one "\\b(python|rust|javascript|typescript|go|java|markdown|json|yaml|shell|c\\+\\+|html|css)\\b" {
-            () => (),
-            lang => match str.lower lang { "python" => "py", "rust" => "rs", "javascript" => "js", "typescript" => "ts", "go" => "go",
-                "java" => "java", "markdown" => "md", "json" => "json", "yaml" => "yaml", "shell" => "sh", "html" => "html",
-                "css" => "css", _ => "cpp" },
-        },
-        e => e,
-    };
+    let size = Option.map (fn n -> {
+        let unit = str.lower (Option.unwrap_or "m" (find_one "\\d+\\s*(k|kb|m|mb|meg|megabytes?|g|gb|gigabytes?)\\b"));
+        n + (if str.starts_with "k" unit { "k" } else if str.starts_with "g" unit { "G" } else { "M" })
+    }) (find_one "(\\d+)\\s*(k|kb|m|mb|meg|megabytes?|g|gb|gigabytes?)\\b");
+    let quoted = find_one "['\"`]([^'\"`]+)['\"`]";
+    let ext = Option.otherwise (Option.map (fn lang -> match str.lower lang {
+            "python" => "py", "rust" => "rs", "javascript" => "js", "typescript" => "ts", "go" => "go",
+            "java" => "java", "markdown" => "md", "json" => "json", "yaml" => "yaml", "shell" => "sh", "html" => "html",
+            "css" => "css", _ => "cpp" })
+        (find_one "\\b(python|rust|javascript|typescript|go|java|markdown|json|yaml|shell|c\\+\\+|html|css)\\b"))
+        (find_one "\\.([a-zA-Z0-9]{1,6})\\b");
     let host = find_one "\\b((?:https?://)?[a-zA-Z0-9-]+(?:\\.[a-zA-Z0-9-]+)+(?:/\\S*)?)";
     let path_word = find_one "((?:\\.{0,2}/|~/)[\\w./-]*)";
-    let named = match quoted { () => find_one "(?:named|called|containing|for|branch)\\s+([\\w.@-]+)", x => x };
+    let named = Option.otherwise (find_one "(?:named|called|containing|for|branch)\\s+([\\w.@-]+)") quoted;
     let pairs = [
         ["n", find_one "\\b(\\d+)\\b"], ["size", size], ["port", find_one "port\\s*:?\\s*(\\d+)"], ["pid", find_one "(?:pid|process)\\s+(\\d+)"],
         ["name", named], ["ext", ext], ["host", host], ["path", path_word], ["branch", find_one "branch\\s+([\\w./-]+)"],
         ["user", find_one "(?:user|as)\\s+([a-z_][\\w-]*)"],
     ];
-    map.from_pairs (list.filter (fn p -> list.nth 1 p != ()) pairs)
+    // Only the holes the question filled.
+    map.from_pairs (list.flat_map (fn [k, v] -> match v { Option.some(x) => [[k, x]], Option.none => [] }) pairs)
 };
 
 /// A recipe's command with the question's values put in its holes; a hole

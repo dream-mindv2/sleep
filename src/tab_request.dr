@@ -93,14 +93,14 @@ priv let set_pairs which ps m = match which {
 
 /// The URL without its query, and with `ps` as its query.
 priv let with_params u ps = {
-    let base = match str.split_once "?" u { () => u, [b, _] => b };
+    let base = match str.split_once "?" u { Option.none => u, Option.some([b, _]) => b };
     let on = list.filter Pair.on ps;
     if on == [] { base } else { base + "?" + str.join_str "&" (list.map (fn p -> url.encode_form (Pair.name p) + "=" + url.encode_form (Pair.value p)) on) }
 };
 /// A URL's query as pairs to edit.
 priv let params_of u = match str.split_once "?" u {
-    () => [],
-    [_, q] => list.map (fn kv -> Pair.make (list.head kv) (list.nth 1 kv) true) (url.decode_query q),
+    Option.none => [],
+    Option.some([_, q]) => list.map (fn kv -> Pair.make (list.head kv) (list.nth 1 kv) true) (url.decode_query q),
 };
 priv let form_pairs m = list.map (fn kv -> Pair.make (list.head kv) (list.nth 1 kv) true) (url.decode_query (Model.body m));
 priv let encode_form ps = str.join_str "&" (list.map (fn p -> url.encode_form (Pair.name p) + "=" + url.encode_form (Pair.value p)) (list.filter Pair.on ps));

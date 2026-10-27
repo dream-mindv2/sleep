@@ -53,7 +53,7 @@ let new id = Model.new () |> Model.set_id id;
 let title : Model -> :string;
 let title m = if not (Model.connected m) { "Database" } else {
     let t = Model.target m;
-    let short = list.last (str.split "/" (match str.split_once "?" t { () => t, [a, _] => a }));
+    let short = list.last (str.split "/" (match str.split_once "?" t { Option.none => t, Option.some([a, _]) => a }));
     ui_common.clip 24 (if short == "" { t } else { short })
 };
 

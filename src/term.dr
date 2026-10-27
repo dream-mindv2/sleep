@@ -878,22 +878,22 @@ priv let csi_marked marker inter final ps t = match [marker, inter, final] {
 
 /// The text after `file://host` in an OSC 7 address, decoded.
 priv let path_of u = match str.split_once "://" u {
-    () => u,
-    [scheme, rest] => match str.find "/" rest { -1 => "/", i => url.decode (str.slice i (str.byte_length rest - i) rest) },
+    Option.none => u,
+    Option.some([scheme, rest]) => match str.find "/" rest { -1 => "/", i => url.decode (str.slice i (str.byte_length rest - i) rest) },
 };
 
 priv let osc text t = match str.split_once ";" text {
-    () => t,
-    [code, body] => match code {
+    Option.none => t,
+    Option.some([code, body]) => match code {
         "0" => event [:title, body] (set_mode Modes.set_title body t),
         "2" => event [:title, body] (set_mode Modes.set_title body t),
         "7" => { let p = path_of body; event [:cwd, p] (set_mode Modes.set_cwd p t) },
         "133" => {
-            let [kind, rest] = match str.split_once ";" body { () => [body, ""], kv => kv };
+            let [kind, rest] = match str.split_once ";" body { Option.none => [body, ""], Option.some(kv) => kv };
             event [:mark, kind, rest, base t + Term.y t, Term.x t] t
         },
         "633" => match str.split_once ";" body {
-            ["E", command] => event [:command, unescape_633 command] t,
+            Option.some(["E", command]) => event [:command, unescape_633 command] t,
             _ => t,
         },
         "1337" => if str.starts_with "CurrentDir=" body { let p = str.trim_prefix "CurrentDir=" body; event [:cwd, p] (set_mode Modes.set_cwd p t) } else { t },
