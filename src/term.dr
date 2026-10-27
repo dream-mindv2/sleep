@@ -909,8 +909,8 @@ priv let unescape_633 s = {
         [] => str.of_chars (list.reverse acc),
         ['\\', '\\', ..rest] => go rest (list.cons '\\' acc),
         ['\\', 'x', a, b, ..rest] => match num.parse_base 16 (str.of_chars [a, b]) {
-            () => go rest acc,
-            n => go rest (list.cons (char.of_code n) acc),
+            Option.none => go rest acc,
+            Option.some(n) => go rest (list.cons (char.of_code n) acc),
         },
         _ => go (list.tail cs) (list.cons (list.head cs) acc),
     };

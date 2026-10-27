@@ -64,7 +64,7 @@ let workflows entries k = {
     let distinct = list.take 400 (list.sort_by (fn a b -> list.nth 1 a > list.nth 1 b)
         (list.filter (fn p -> list.head p != "") (map.pairs counts)));
     if len distinct < k * 2 { [] } else {
-        let feats = fn c -> list.cons ("prog:" + history.head c) (list.filter (fn w -> str.length w > 1 && num.parse_int w == ()) (text.tokens c));
+        let feats = fn c -> list.cons ("prog:" + history.head c) (list.filter (fn w -> str.length w > 1 && Option.is_none (num.parse_int w)) (text.tokens c));
         let model = text.fit_tfidf (list.map (fn p -> feats (list.head p)) distinct);
         let vectors = list.map (fn p -> text.vector model (feats (list.head p))) distinct;
         let c = cluster.kmeans_sparse k 17 vectors;

@@ -404,7 +404,7 @@ priv let on_event! e s = match e {
     },
     [:mark, "D", code, line, col] => match State.phase s {
         Phase.running(command, prompt_line, out_line, started, cwd) => {
-            let exit = match num.parse_int code { () => 0, n => n };
+            let exit = match num.parse_int code { Option.none => 0, Option.some(n) => n };
             let elapsed = now_ms! () - started;
             let kind = if exit == 0 { "ok" } else { "error" };
             let entry = Entry.new () |> Entry.set_command command |> Entry.set_cwd cwd |> Entry.set_exit exit

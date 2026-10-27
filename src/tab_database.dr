@@ -87,7 +87,7 @@ let update! wrap msg m = match msg {
         run_sql! (Model.set_sql text m) text
     },
     Msg.sql(s) => Model.set_sql s m,
-    Msg.limit(s) => match num.parse_int s { () => m, n => Model.set_limit n m },
+    Msg.limit(s) => match num.parse_int s { Option.none => m, Option.some(n) => Model.set_limit n m },
     Msg.run => if not (Model.connected m) || str.trim (Model.sql m) == "" { m } else { run_sql! m (Model.sql m) },
     Msg.recall(s) => Model.set_sql s m,
     Msg.answered(v) => match v.["op" else ""] {

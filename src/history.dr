@@ -63,7 +63,7 @@ priv let zsh_line l = if str.starts_with ": " l {
     match str.split_once ";" l {
         () => Entry.new () |> Entry.set_command l,
         [stamp, command] => {
-            let seconds = match num.parse_int (str.trim (list.head (str.split ":" (str.trim_prefix ": " stamp)))) { () => 0, n => n };
+            let seconds = match num.parse_int (str.trim (list.head (str.split ":" (str.trim_prefix ": " stamp)))) { Option.none => 0, Option.some(n) => n };
             Entry.new () |> Entry.set_command command |> Entry.set_start (seconds * 1000)
         },
     }
@@ -87,9 +87,9 @@ let shell_history! u = {
                     [] => list.reverse acc,
                     _ => {
                         let l = list.head ls;
-                        match (if str.starts_with "#" l { num.parse_int (str.trim_prefix "#" l) } else { () }) {
-                            () => go (list.tail ls) 0 (list.cons (Entry.new () |> Entry.set_command l |> Entry.set_start stamp) acc),
-                            seconds => go (list.tail ls) (seconds * 1000) acc,
+                        match (if str.starts_with "#" l { num.parse_int (str.trim_prefix "#" l) } else { Option.none }) {
+                            Option.none => go (list.tail ls) 0 (list.cons (Entry.new () |> Entry.set_command l |> Entry.set_start stamp) acc),
+                            Option.some(seconds) => go (list.tail ls) (seconds * 1000) acc,
                         }
                     },
                 };
